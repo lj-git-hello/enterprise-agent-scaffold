@@ -29,6 +29,7 @@ frontend/dist/
 # ==================== 6. 编辑器与系统临时缓存 ====================
 .vscode/
 frontend/.vscode/
+.claude/
 .DS_Store
 Thumbs.db
 
