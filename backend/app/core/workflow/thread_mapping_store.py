@@ -23,6 +23,14 @@ STATUS_WAITING_HUMAN = "WAITING_HUMAN"
 # 通用兜底角色（无状态机的纯对话线程）
 ROLE_SYSTEM = "SYSTEM"
 
+# 聊天线程命名空间前缀（通用层约定：与业务工单线程天然隔离）。
+# 本模块是 thread_id 语义的权威定义处，其它模块一律从此导入，勿重复定义。
+CHAT_THREAD_PREFIX = "chat_"
+
+# 线程类别（由命名空间前缀推导，不新增业务语义列）
+THREAD_KIND_CHAT = "chat"
+THREAD_KIND_TASK = "task"
+
 
 class ThreadMappingStore:
     """无状态线程映射仓储（全部静态方法）。"""
@@ -37,8 +45,12 @@ class ThreadMappingStore:
         creator_dept: str | None = None,
         status: str = STATUS_DRAFT,
         idempotency_key: str | None = None,
+        title: str | None = None,
     ) -> AIThreadMapping:
-        """建立线程映射（幂等）：已存在则原样返回，不重复插入。"""
+        """建立线程映射（幂等）：已存在则原样返回，不重复插入。
+
+        title 为线程展示标题：业务语义由插件注入，核心层只当不透明字符串存取。
+        """
         async with AsyncSessionLocal() as session:
             existing = await session.get(AIThreadMapping, thread_id)
             if existing is not None:
@@ -54,6 +66,7 @@ class ThreadMappingStore:
                 status=status,
                 lock_version=1,
                 idempotency_key=idempotency_key,
+                title=title,
             )
             session.add(mapping)
             try:
@@ -136,6 +149,81 @@ class ThreadMappingStore:
         return items
 
     @staticmethod
+    async def list_visible(
+        user_id: str,
+        user_role: str,
+        *,
+        kind: str = "all",
+        session_id: str | None = None,
+        include_archived: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """列出当前用户可见的线程（会话 / 工单条目）。
+
+        可见性：creator_id / operator_id / assigned_role 三命中其一
+        （assigned_role 命中需排除系统占位角色，避免"人人可见"）。
+
+        thread_kind 由命名空间前缀推导（chat_ 前缀为对话线程），不新增业务语义列。
+        title 为解析后的展示标题：title 列 → 首条文本消息前 60 字 → thread_id。
+        last_activity_at 取该线程最后一条消息时间，供列表按"最近活跃"排序。
+        """
+        sql = text(
+            "SELECT t.thread_id, t.session_id, t.creator_id, t.creator_role, "
+            "t.assigned_role, t.status, t.lock_version, t.current_node, "
+            "t.created_at, t.updated_at, "
+            "CASE WHEN t.thread_id LIKE 'chat\\_%' THEN 'chat' ELSE 'task' END "
+            "AS thread_kind, "
+            "COALESCE( "
+            "  NULLIF(t.title, ''), "
+            "  NULLIF((SELECT left(m.content, 60) "
+            "          FROM ai_chat_messages m "
+            "          WHERE m.thread_id = t.thread_id "
+            "            AND m.kind = 'text' "
+            "            AND m.content IS NOT NULL AND m.content <> '' "
+            "          ORDER BY m.seq LIMIT 1), ''), "
+            "  t.thread_id "
+            ") AS title, "
+            "COALESCE(a.last_activity, t.created_at) AS last_activity_at "
+            "FROM ai_thread_mappings t "
+            "LEFT JOIN LATERAL ( "
+            "  SELECT max(m.created_at) AS last_activity "
+            "  FROM ai_chat_messages m "
+            "  WHERE m.thread_id = t.thread_id "
+            ") a ON TRUE "
+            "WHERE (CAST(:include_archived AS boolean) OR t.is_archived = false) "
+            "  AND (t.creator_id = :uid "
+            "       OR t.operator_id = :uid "
+            "       OR (t.assigned_role <> :system_role "
+            "           AND t.assigned_role = :role)) "
+            "  AND (CAST(:session_id AS text) IS NULL "
+            "       OR t.session_id = :session_id) "
+            "  AND (CAST(:kind AS text) <> 'task' "
+            "       OR t.thread_id NOT LIKE 'chat\\_%') "
+            "ORDER BY COALESCE(a.last_activity, t.created_at) DESC, t.thread_id DESC "
+            "LIMIT CAST(:limit AS integer) OFFSET CAST(:offset AS integer)"
+        )
+        params: dict[str, Any] = {
+            "uid": user_id,
+            "role": user_role or "",
+            "system_role": ROLE_SYSTEM,
+            "kind": kind,
+            "session_id": session_id,
+            "include_archived": include_archived,
+            "limit": max(1, min(limit, 500)),
+            "offset": max(0, offset),
+        }
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(sql, params)
+            items = [dict(row._mapping) for row in rows]
+        for item in items:
+            for key in ("created_at", "updated_at", "last_activity_at"):
+                value = item.get(key)
+                if value is not None:
+                    item[key] = value.isoformat()
+        return items
+
+    @staticmethod
     async def get(thread_id: str) -> dict[str, Any] | None:
         """读取线程映射快照；不存在返回 None。"""
         async with AsyncSessionLocal() as session:
@@ -148,22 +236,32 @@ class ThreadMappingStore:
                 "creator_id": mapping.creator_id,
                 "creator_role": mapping.creator_role,
                 "assigned_role": mapping.assigned_role,
+                "operator_id": mapping.operator_id,
                 "status": mapping.status,
                 "lock_version": mapping.lock_version,
                 "current_node": mapping.current_node,
+                "title": mapping.title,
                 "is_archived": mapping.is_archived,
                 "created_at": (
                     mapping.created_at.isoformat()
                     if mapping.created_at is not None
                     else None
                 ),
+                "updated_at": (
+                    mapping.updated_at.isoformat()
+                    if mapping.updated_at is not None
+                    else None
+                ),
             }
 
 
 __all__ = [
+    "CHAT_THREAD_PREFIX",
     "ROLE_SYSTEM",
     "STATUS_ACTIVE",
     "STATUS_DRAFT",
     "STATUS_WAITING_HUMAN",
+    "THREAD_KIND_CHAT",
+    "THREAD_KIND_TASK",
     "ThreadMappingStore",
 ]

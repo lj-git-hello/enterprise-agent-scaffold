@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Index,
@@ -68,6 +69,9 @@ class AIThreadMapping(Base):
     )
     # 状态机当前节点指针
     current_node: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 线程展示标题：业务语义由插件注入，核心层只当不透明字符串存取；
+    # 存量行为 NULL，列表查询回退到首条文本消息摘要
+    title: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # CAS 乐观锁版本号
     lock_version: Mapped[int] = mapped_column(
         Integer, server_default=text("1"), default=1, nullable=False
@@ -124,6 +128,16 @@ class AIChatMessage(Base):
     card_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     card_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     retry_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # 全局单调序号：跨线程消息排序的确定性兜底
+    # （created_at 为 transaction timestamp，同一事务内多行可能同值，
+    #   且 PG 不保证同值行的物理顺序）
+    seq: Mapped[int] = mapped_column(
+        BigInteger,
+        server_default=text("nextval('ai_chat_messages_seq_seq'::regclass)"),
+        nullable=False,
+    )
+    # 客户端消息幂等键：同一线程内唯一（部分唯一索引，存量行为 NULL）
+    client_msg_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_sanitized: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False, nullable=False
     )

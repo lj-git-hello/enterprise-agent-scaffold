@@ -16,6 +16,7 @@ from app.core.workflow import (
     HITLController,
     MessageRecorder,
     ThreadMappingStore,
+    assert_thread_visible,
 )
 from app.plugins.power_grid.constants import (
     POWER_CARD_TYPE_DISPATCHER_AUDIT,
@@ -56,6 +57,21 @@ class AuditRequest(BaseModel):
     opinion: str = ""
 
 
+async def _thread_summary(thread_id: str) -> dict:
+    """线程摘要（供前端左栏与服务端对齐，字段一律以服务端为准）。"""
+    mapping = await ThreadMappingStore.get(thread_id)
+    if mapping is None:
+        return {}
+    return {
+        "thread_id": mapping["thread_id"],
+        "session_id": mapping["session_id"],
+        "title": mapping["title"],
+        "status": mapping["status"],
+        "lock_version": mapping["lock_version"],
+        "current_node": mapping["current_node"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # POST /apply
 # ---------------------------------------------------------------------------
@@ -68,6 +84,9 @@ async def apply_dispatch(
     user_id = current_user["sub"]
     thread_id = f"{req.session_id}_{uuid.uuid4().hex[:12]}"
 
+    # 业务标题（标题语义属插件私有，核心层只当不透明字符串存取）
+    title = f"{req.substation} {req.voltage_level} {req.operation_task}".strip()[:128]
+
     # 建档（通用层封装持久化，Router 不直接写 ORM）
     await ThreadMappingStore.create_mapping(
         thread_id=thread_id,
@@ -77,6 +96,7 @@ async def apply_dispatch(
         assigned_role=POWER_ROLE_DISPATCHER,
         creator_dept=current_user.get("dept"),
         status=POWER_STATUS_WAITING_HUMAN,
+        title=title,
     )
 
     # 取已注册的电网图（lifespan / 测试 bootstrap 时按插件名注册）
@@ -130,6 +150,9 @@ async def apply_dispatch(
             "interrupted": False,
             "message": content,
             "card": {},
+            "session_id": req.session_id,
+            "card_type": None,
+            "thread": await _thread_summary(thread_id),
         }
 
     card_payload = {
@@ -156,6 +179,9 @@ async def apply_dispatch(
         "status": POWER_STATUS_WAITING_HUMAN,
         "interrupted": True,
         "card": card_payload,
+        "session_id": req.session_id,
+        "card_type": POWER_CARD_TYPE_DISPATCHER_AUDIT,
+        "thread": await _thread_summary(thread_id),
     }
 
 
@@ -191,7 +217,16 @@ async def list_thread_messages(
     thread_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """按 thread_id 读取消息 / 卡片快照（只读）；无记录返回空列表。"""
+    """按 thread_id 读取消息 / 卡片快照（只读）；无记录返回空列表。
+
+    可见性由通用底座统一判定：不可见与不存在统一 404，
+    不泄露"存在但无权"这一事实。
+    """
+    await assert_thread_visible(
+        thread_id,
+        current_user["sub"],
+        current_user.get("role") or "",
+    )
     items = await MessageRecorder.list_by_thread(thread_id)
     return {
         "thread_id": thread_id,

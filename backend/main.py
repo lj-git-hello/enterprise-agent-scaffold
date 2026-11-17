@@ -35,6 +35,7 @@ from app.api.v1.agent import agent_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.knowledge import knowledge_router
 from app.api.v1.plugin import plugin_router
+from app.api.v1.threads import thread_router
 
 # 生效业务插件：模块级装载 —— 插件契约违规 / 生效插件无法确定时启动即失败
 active_plugin = PluginLoader.load_active()
@@ -86,6 +87,7 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(knowledge_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
 app.include_router(plugin_router, prefix="/api/v1")
+app.include_router(thread_router, prefix="/api/v1")
 
 # ---- 业务插件路由（按插件清单声明的前缀挂载） ----
 app.include_router(active_plugin.router, prefix=active_plugin.router_prefix)

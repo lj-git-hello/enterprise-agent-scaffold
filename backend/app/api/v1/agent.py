@@ -7,9 +7,10 @@
 2. 线程命名空间隔离（聊天线程统一加 chat_ 前缀，与业务工单线程天然区分）；
 3. 取活跃插件的 chat_handler 并驱动其事件流；
 4. 逐事件 SSE 分帧推送；
-5. 消息落库（MessageRecorder）；
+5. 消息与卡片落库（MessageRecorder；卡片"先落库再推帧"，保证推给用户的即已持久化）；
 6. 执行留痕（AIExecutionTrace —— 此前有表无写入）；
-7. 始终以 done（正常）或 error（异常/未接入）收口，绝不悬挂。
+7. 始终以 done（正常）或 error（异常/未接入）收口，绝不悬挂；
+8. 整轮幂等：客户端幂等键命中即识别为重放，不再重复执行业务处理器。
 
 本模块不包含任何业务词汇；业务语义完全由插件的 chat_handler 决定。
 """
@@ -27,6 +28,7 @@ from app.core.plugin.loader import PluginLoader
 from app.core.plugin.manifest import ChatContext
 from app.core.security import get_current_user
 from app.core.workflow import (
+    CHAT_THREAD_PREFIX,
     MessageRecorder,
     ThreadMappingStore,
 )
@@ -45,10 +47,11 @@ logger = logging.getLogger(__name__)
 
 agent_router = APIRouter(prefix="/agent", tags=["Universal-Agent"])
 
-# 聊天线程命名空间前缀（与业务工单线程天然隔离）
-CHAT_THREAD_PREFIX = "chat_"
 # 幂等键前缀
 CHAT_IDEMPOTENCY_PREFIX = "chat:"
+
+# 终结码：整轮对话此前已提交，本次请求为重放
+TURN_ALREADY_SUBMITTED = "TURN_ALREADY_SUBMITTED"
 
 # 消息角色
 ROLE_USER = "user"
@@ -57,6 +60,9 @@ ROLE_ASSISTANT = "assistant"
 # 固定文案
 NO_HANDLER_MESSAGE = "当前业务插件未接入对话能力，请改用业务表单提交。"
 EMPTY_INPUT_MESSAGE = "消息内容为空，请输入内容后再发送。"
+
+# 线程展示标题的最大长度
+TITLE_MAX_LENGTH = 60
 
 # SSE 响应头（禁用 Nginx 缓冲，保证逐字推流）
 SSE_HEADERS = {
@@ -122,6 +128,37 @@ def _sse_event(event: AgentChatEvent) -> str:
     return _sse_frame(event.type.value, payload)
 
 
+def _derive_title(message: str) -> str | None:
+    """从首条用户消息推导线程展示标题（通用语义：取首行并截断）。
+
+    核心层只做"截断首行"这一普适动作，不理解任何业务语义。
+    """
+    lines = (message or "").strip().splitlines()
+    first = lines[0].strip() if lines else ""
+    if not first:
+        return None
+    return first[:TITLE_MAX_LENGTH]
+
+
+async def _record_card_safely(
+    thread_id: str, card_type: str, data: dict[str, Any]
+) -> None:
+    """卡片快照落库（旁路语义：失败仅告警，绝不阻断对话流）。
+
+    card_payload 内保留 card_type 键，与前端实时构造的形态逐字段一致，
+    保证"实时态"与"回读态"的卡片载荷完全相同（刷新后卡片不变形）。
+    """
+    try:
+        await MessageRecorder.record_card(
+            thread_id=thread_id,
+            role=ROLE_ASSISTANT,
+            card_type=card_type,
+            card_payload={**data, "card_type": card_type},
+        )
+    except Exception:  # noqa: BLE001 —— 落库属旁路，失败不中断流
+        logger.exception("[对话网关] 卡片快照落库失败 card_type=%s", card_type)
+
+
 @agent_router.post("/chat-stream")
 async def chat_stream(
     req: AgentChatRequest,
@@ -149,17 +186,31 @@ async def chat_stream(
         assigned_role=ROLE_SYSTEM,
         status=STATUS_ACTIVE,
         idempotency_key=f"{CHAT_IDEMPOTENCY_PREFIX}{physical_thread_id}",
+        title=_derive_title(req.message),
     )
 
-    # 用户消息落库
+    # 用户消息落库（带客户端幂等键：命中唯一索引说明该轮此前已提交）
+    replayed = False
     if req.message.strip():
-        await MessageRecorder.record_text(
+        persisted = await MessageRecorder.record_text(
             thread_id=physical_thread_id,
             role=ROLE_USER,
             content=req.message,
+            client_msg_id=req.client_msg_id,
         )
+        if persisted is None and req.client_msg_id:
+            replayed = True
 
     async def event_stream() -> AsyncIterator[str]:
+        # 整轮重放：该轮此前已提交，不再执行业务处理器
+        # （避免重复消耗 LLM 与重复产出内容），仅以终结码收口
+        if replayed:
+            yield _sse_frame(
+                A2UIEventType.DONE.value,
+                {"type": "done", "code": TURN_ALREADY_SUBMITTED},
+            )
+            return
+
         if handler is None:
             yield _sse_frame(
                 A2UIEventType.ERROR.value, {"message": NO_HANDLER_MESSAGE}
@@ -175,25 +226,45 @@ async def chat_stream(
             trace_sink=TraceWriter(thread_id=physical_thread_id),
         )
 
-        collected: list[str] = []
+        # 分段缓冲：文本先缓冲，遇卡片先 flush 文本再落卡片，
+        # 保证服务端 seq 顺序 == 用户实时所见顺序
+        pending_text: list[str] = []
+
+        async def flush_text() -> None:
+            """把缓冲的助手文本落库（落库失败仅告警，不中断流）。"""
+            if not pending_text:
+                return
+            answer = "".join(pending_text)
+            pending_text.clear()
+            if not answer:
+                return
+            try:
+                await MessageRecorder.record_text(
+                    thread_id=physical_thread_id,
+                    role=ROLE_ASSISTANT,
+                    content=answer,
+                )
+            except Exception:  # noqa: BLE001 —— 落库失败不得中断流
+                logger.exception("[对话网关] 助手消息落库失败")
+
         failure: str | None = None
         try:
             async for event in handler(context, req):
                 if event.type == A2UIEventType.TOKEN and event.content:
-                    collected.append(event.content)
+                    pending_text.append(event.content)
+                elif event.type == A2UIEventType.UI_CARD and event.card_type:
+                    # 先落文本再落卡片：顺序即用户所见顺序
+                    await flush_text()
+                    await _record_card_safely(
+                        physical_thread_id, event.card_type, event.data or {}
+                    )
                 yield _sse_event(event)
         except Exception as exc:  # noqa: BLE001 —— 异常统一降级为 error 事件
             logger.exception("[对话网关] 插件对话处理器异常")
             failure = f"对话执行异常：{type(exc).__name__}"
-
-        # 助手消息落库（成功与异常路径都保留已产出内容）
-        answer = "".join(collected)
-        if answer:
-            await MessageRecorder.record_text(
-                thread_id=physical_thread_id,
-                role=ROLE_ASSISTANT,
-                content=answer,
-            )
+        finally:
+            # 断流 / 异常路径同样尽量保留已产出内容
+            await flush_text()
 
         if failure is not None:
             yield _sse_frame(A2UIEventType.ERROR.value, {"message": failure})
@@ -209,6 +280,7 @@ async def chat_stream(
 
 __all__ = [
     "CHAT_THREAD_PREFIX",
+    "TURN_ALREADY_SUBMITTED",
     "TraceWriter",
     "agent_router",
     "build_chat_thread_id",

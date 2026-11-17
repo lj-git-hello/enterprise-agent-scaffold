@@ -3,6 +3,7 @@
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import AsyncSessionLocal
 from app.models.ai_schema import AIChatMessage
@@ -23,8 +24,14 @@ class MessageRecorder:
         card_payload: dict[str, Any],
         retry_payload: dict[str, Any] | None = None,
         content: str | None = None,
-    ) -> AIChatMessage:
-        """向 ai_chat_messages 写入结构化卡片与自包含重试载荷并提交。"""
+        *,
+        client_msg_id: str | None = None,
+    ) -> AIChatMessage | None:
+        """向 ai_chat_messages 写入结构化卡片与自包含重试载荷并提交。
+
+        client_msg_id 为客户端幂等键：命中部分唯一索引时视为重复投递，
+        跳过写入并返回 None（调用方据此识别重放）。
+        """
         message = AIChatMessage(
             thread_id=thread_id,
             role=role,
@@ -33,10 +40,17 @@ class MessageRecorder:
             card_type=card_type,
             card_payload=card_payload,
             retry_payload=retry_payload,
+            client_msg_id=client_msg_id,
         )
         async with AsyncSessionLocal() as session:
             session.add(message)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                if await _client_msg_exists(session, thread_id, client_msg_id):
+                    return None
+                raise
         return message
 
     @staticmethod
@@ -44,40 +58,114 @@ class MessageRecorder:
         thread_id: str,
         role: str,
         content: str,
-    ) -> AIChatMessage:
-        """写入普通文本消息并提交。"""
+        *,
+        client_msg_id: str | None = None,
+    ) -> AIChatMessage | None:
+        """写入普通文本消息并提交。
+
+        client_msg_id 幂等语义同 record_card：重复投递返回 None。
+        """
         message = AIChatMessage(
             thread_id=thread_id,
             role=role,
             kind=KIND_TEXT,
             content=content,
+            client_msg_id=client_msg_id,
         )
         async with AsyncSessionLocal() as session:
             session.add(message)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                if await _client_msg_exists(session, thread_id, client_msg_id):
+                    return None
+                raise
         return message
 
     @staticmethod
     async def list_by_thread(thread_id: str) -> list[dict[str, Any]]:
-        """按 thread_id 读取消息 / 卡片快照，按 created_at 升序；无记录返回 []。
+        """按 thread_id 读取消息 / 卡片快照，按 seq 升序；无记录返回 []。
 
         JSONB 列由驱动还原为 dict；时间转 ISO 字符串，保证可 JSON 序列化。
         """
         sql = text(
-            "SELECT id, thread_id, role, kind, content, card_type, "
+            "SELECT id, seq, thread_id, role, kind, content, card_type, "
             "card_payload, retry_payload, created_at "
             "FROM ai_chat_messages "
             "WHERE thread_id = :thread_id "
-            "ORDER BY created_at ASC"
+            "ORDER BY seq ASC"
         )
         async with AsyncSessionLocal() as session:
             rows = await session.execute(sql, {"thread_id": thread_id})
 
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row._mapping)
-            created_at = item.get("created_at")
-            if created_at is not None:
-                item["created_at"] = created_at.isoformat()
-            items.append(item)
-        return items
+        return [_to_message_dict(row) for row in rows]
+
+    @staticmethod
+    async def list_by_threads(
+        thread_ids: list[str],
+        *,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """按线程集合读取消息，按 seq 升序（跨线程稳定全序）；无记录返回 []。
+
+        seq 是全局单调序号：created_at 为 transaction timestamp、同值行序
+        不确定，跨线程交错排序必须依赖 seq。
+        """
+        if not thread_ids:
+            return []
+        sql = text(
+            "SELECT id, seq, thread_id, role, kind, content, card_type, "
+            "card_payload, retry_payload, created_at "
+            "FROM ai_chat_messages "
+            "WHERE thread_id = ANY(:tids) "
+            "ORDER BY seq ASC "
+            "LIMIT CAST(:limit AS integer) OFFSET CAST(:offset AS integer)"
+        )
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(
+                sql,
+                {
+                    "tids": list(thread_ids),
+                    "limit": max(1, min(limit, 500)),
+                    "offset": max(0, offset),
+                },
+            )
+
+        return [_to_message_dict(row) for row in rows]
+
+
+async def _client_msg_exists(
+    session: Any,
+    thread_id: str,
+    client_msg_id: str | None,
+) -> bool:
+    """判断是否因客户端幂等键冲突而失败（用于区分幂等命中与真实约束错误）。"""
+    if not client_msg_id:
+        return False
+    result = await session.execute(
+        text(
+            "SELECT 1 FROM ai_chat_messages "
+            "WHERE thread_id = :thread_id AND client_msg_id = :cmid "
+            "LIMIT 1"
+        ),
+        {"thread_id": thread_id, "cmid": client_msg_id},
+    )
+    return result.first() is not None
+
+
+def _to_message_dict(row: Any) -> dict[str, Any]:
+    """把查询行转成可 JSON 序列化的消息字典（时间转 ISO 字符串）。"""
+    item = dict(row._mapping)
+    created_at = item.get("created_at")
+    if created_at is not None:
+        item["created_at"] = created_at.isoformat()
+    return item
+
+
+__all__ = [
+    "KIND_CARD",
+    "KIND_TEXT",
+    "MessageRecorder",
+]

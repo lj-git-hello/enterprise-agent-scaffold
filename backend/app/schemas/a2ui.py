@@ -54,6 +54,11 @@ class AgentChatRequest(BaseModel):
             }
         },
     )
+    client_msg_id: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="客户端消息幂等键：同一轮重放（如 SSE 断线重连）不重复落库",
+    )
 
 
 class AgentChatEvent(BaseModel):
@@ -63,7 +68,9 @@ class AgentChatEvent(BaseModel):
     - token：content 承载增量文本
     - ui_card：card_type 承载卡片类型，data 承载卡片结构体
     - error：message 承载错误描述
-    - done：全部字段可缺省
+    - done：全部字段可缺省；code 承载终结码（如整轮已提交）
+
+    code 取值（TURN_ALREADY_SUBMITTED = 整轮此前已提交，本次为重放）
     """
 
     type: A2UIEventType
@@ -71,6 +78,7 @@ class AgentChatEvent(BaseModel):
     card_type: Optional[str] = None
     data: Optional[dict[str, Any]] = None
     message: Optional[str] = None
+    code: Optional[str] = None
 
 
 __all__ = [
