@@ -15,6 +15,17 @@ const props = defineProps<{
   actionContext?: CardActionContext
 }>()
 
+/**
+ * 卡片动作事件透传。
+ *
+ * 卡片组件内部自行提交后端（依赖反转），宿主的职责只是把结果上报给
+ * 上层：decided = 审批完成（需刷新左栏），conflict = CAS 冲突（项已失效）。
+ */
+const emit = defineEmits<{
+  decided: [permitted: boolean]
+  conflict: []
+}>()
+
 // 动态组件（未注册时为 undefined → 走兜底）
 const resolved = computed(() =>
   props.message.card_type ? CardRegistry.get(props.message.card_type) : undefined,
@@ -33,6 +44,8 @@ const fallbackJson = computed(() =>
       v-if="resolved"
       :message="message"
       :action-context="actionContext"
+      @decided="(permitted: boolean) => emit('decided', permitted)"
+      @conflict="emit('conflict')"
     />
 
     <!-- 未注册卡片：JSON 兜底 -->

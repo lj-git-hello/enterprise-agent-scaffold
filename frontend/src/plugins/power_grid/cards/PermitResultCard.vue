@@ -3,6 +3,9 @@
  * PermitResultCard —— 终态调度许可凭证卡片（业务插件）。
  *
  * 展示调度令编号、许可时间、CA 签名摘要，并将签名渲染为现场核验二维码。
+ *
+ * 离线兜底快照会剔除签名摘要与调度令编号（见插件脱敏器），
+ * 此时必须优雅降级：缺字段不抛错、不渲染残缺二维码。
  */
 import { computed } from 'vue'
 import QrcodeVue from 'qrcode.vue'
@@ -10,9 +13,9 @@ import QrcodeVue from 'qrcode.vue'
 import type { ChatMessageRecord } from '@/core/a2ui/types'
 
 interface PermitInfo {
-  permit_no: string
-  ca_signature_hash: string
-  issued_at: string
+  permit_no?: string
+  ca_signature_hash?: string
+  issued_at?: string
 }
 
 const props = defineProps<{
@@ -29,10 +32,25 @@ const permitInfo = computed<PermitInfo | null>(
 
 const status = computed(() => String(payload.value.status ?? ''))
 
-// 二维码内容：签名摘要（附编号保证唯一性）
+const permitNo = computed(() => permitInfo.value?.permit_no ?? '')
+
+const issuedAt = computed(() => permitInfo.value?.issued_at ?? '')
+
+/** 签名摘要（脱敏后可能缺省） */
+const signatureDigest = computed(() => {
+  const hash = permitInfo.value?.ca_signature_hash
+  return hash ? `${hash.slice(0, 24)}…` : ''
+})
+
+/**
+ * 二维码内容：签名摘要 + 编号。
+ *
+ * 任一要素缺失即不渲染二维码：残缺二维码会让现场核验误判。
+ */
 const qrValue = computed(() => {
   const info = permitInfo.value
-  return info ? `${info.permit_no}|${info.ca_signature_hash}` : ''
+  if (!info?.ca_signature_hash || !info.permit_no) return ''
+  return `${info.permit_no}|${info.ca_signature_hash}`
 })
 </script>
 
@@ -53,21 +71,21 @@ const qrValue = computed(() => {
       <dl class="flex flex-col gap-1 text-xs text-gray-600">
         <div class="flex gap-2">
           <dt class="shrink-0 text-gray-400">调度令编号：</dt>
-          <dd class="break-all">{{ permitInfo.permit_no }}</dd>
+          <dd class="break-all">{{ permitNo || '—' }}</dd>
         </div>
         <div class="flex gap-2">
           <dt class="shrink-0 text-gray-400">许可时间：</dt>
-          <dd>{{ permitInfo.issued_at }}</dd>
+          <dd>{{ issuedAt || '—' }}</dd>
         </div>
         <div class="flex gap-2">
           <dt class="shrink-0 text-gray-400">CA 签名：</dt>
           <dd class="break-all font-mono text-[10px]">
-            {{ permitInfo.ca_signature_hash.slice(0, 24) }}…
+            {{ signatureDigest || '本地快照未缓存签名摘要' }}
           </dd>
         </div>
       </dl>
 
-      <div class="flex justify-center rounded-md border border-gray-200 bg-white p-2">
+      <div v-if="qrValue" class="flex justify-center rounded-md border border-gray-200 bg-white p-2">
         <QrcodeVue
           :value="qrValue"
           :size="120"
@@ -75,7 +93,7 @@ const qrValue = computed(() => {
           render-as="svg"
         />
       </div>
-      <p class="text-center text-[10px] text-gray-400">现场扫码核验凭证</p>
+      <p v-if="qrValue" class="text-center text-[10px] text-gray-400">现场扫码核验凭证</p>
     </template>
 
     <p v-else class="text-xs text-gray-400">暂无许可信息</p>

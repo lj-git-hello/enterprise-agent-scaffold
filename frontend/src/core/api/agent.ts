@@ -16,6 +16,9 @@ import { API_BASE, TOKEN_STORAGE_KEY } from './http'
 /** 通用对话流端点（相对 /api） */
 export const CHAT_STREAM_PATH = '/v1/agent/chat-stream'
 
+/** 终结码：整轮对话此前已提交，本次请求为重放（服务端未执行业务处理器） */
+export const TURN_ALREADY_SUBMITTED = 'TURN_ALREADY_SUBMITTED'
+
 /** 流事件类型（与后端 A2UIEventType 一一对应） */
 export type ChatEventType = 'token' | 'ui_card' | 'error' | 'done'
 
@@ -24,6 +27,12 @@ export interface ChatStreamRequest {
   thread_id: string
   session_id: string
   message: string
+  /**
+   * 客户端消息幂等键（同一轮唯一）。
+   *
+   * 服务端据此识别整轮重放：不重复落库、不重复执行业务处理器。
+   */
+  client_msg_id?: string
 }
 
 /** 扁平事件负载 */
@@ -33,6 +42,8 @@ export interface AgentChatEvent {
   card_type?: string | null
   data?: Record<string, unknown> | null
   message?: string | null
+  /** 终结码（done 事件承载，如 TURN_ALREADY_SUBMITTED） */
+  code?: string | null
 }
 
 /** 流连接状态（驱动界面状态灯）
@@ -58,6 +69,8 @@ export interface ChatStreamHandlers {
   onError?: (message: string) => void
   onDone?: () => void
   onStatus?: (status: StreamStatus) => void
+  /** 整轮重放（本轮此前已提交，服务端未执行业务处理器） */
+  onReplay?: (code: string) => void
 }
 
 /** 断线重连间隔（毫秒） */
@@ -90,6 +103,13 @@ export async function chatStream(
   let retryCount = 0
   /** 流是否正常收到 done 事件（用于区分"正常结束"与"异常断开"） */
   let finished = false
+  /**
+   * 流是否已经建立过连接。
+   *
+   * 一旦建立，说明服务端已开始执行本轮；此后任何错误都**不得自动重放**
+   * （重放 = 整条 POST 重发，会重复消耗 LLM 并产生重复消息）。
+   */
+  let opened = false
 
   const dispatch = (payload: AgentChatEvent): void => {
     switch (payload.type) {
@@ -111,6 +131,9 @@ export async function chatStream(
         break
       case 'done':
         finished = true
+        if (payload.code === TURN_ALREADY_SUBMITTED) {
+          handlers.onReplay?.(payload.code)
+        }
         handlers.onDone?.()
         break
     }
@@ -143,6 +166,7 @@ export async function chatStream(
         throw error
       }
       retryCount = 0
+      opened = true
       handlers.onStatus?.('connected')
     },
     onmessage: (message) => {
@@ -159,6 +183,13 @@ export async function chatStream(
       dispatch(payload)
     },
     onerror: (error) => {
+      // 连接已建立 → 服务端已开始执行本轮：自动重放会重复消费 LLM
+      // 并产生重复消息。此处直接判定为断开，由用户显式重发
+      // （显式重发 = 新一轮 = 新 client_msg_id，语义清晰）。
+      if (opened) {
+        handlers.onStatus?.('offline')
+        throw error
+      }
       retryCount += 1
       if (isFatal(error) || retryCount > MAX_RECONNECT_ATTEMPTS) {
         handlers.onStatus?.('offline')

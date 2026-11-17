@@ -17,11 +17,14 @@ import type {
 import { http } from '../api/http'
 import { useWorkflowAction } from '../composables/useWorkflowAction'
 import { PluginRegistry } from '../plugins/registry'
+import { useWorkbenchStore } from '../workbench/useWorkbenchStore'
 
 const props = defineProps<{
   currentUserId: string
   currentRole: string
 }>()
+
+const workbench = useWorkbenchStore()
 
 // 端点由插件注册表下发（后端 manifest 为唯一真相源）；core 不写死任何业务路径
 const endpoints = computed(() => PluginRegistry.activeEndpoints.value)
@@ -88,9 +91,11 @@ async function decide(task: TaskSummary, approved: boolean) {
       approved,
       opinion: approved ? '核准许可' : '驳回修改',
     },
-    // 成功：刷新待办与详情
+    // 成功：刷新待办与详情，并标记左栏会话集合陈旧
+    // （终态与锁版本以服务端为准，左栏必须重新对齐，否则显示陈旧态）
     async () => {
       await fetchTasks()
+      workbench.markConversationsStale()
       if (selectedThreadId.value === task.thread_id) {
         selectedThreadId.value = null
         detailMessages.value = []
@@ -113,6 +118,24 @@ function makeActionContext(message: ChatMessageRecord): CardActionContext {
     retryPayload: message.retry_payload,
     dispatch: () => undefined,
   }
+}
+
+/**
+ * 卡片内直接审批（通过 / 驳回）后刷新待办池。
+ *
+ * 终态任务必须从待办池剔除，否则用户会看到已处理的单据仍在列表里。
+ */
+async function onCardDecided() {
+  await fetchTasks()
+  selectedThreadId.value = null
+  detailMessages.value = []
+}
+
+/** 409 冲突：任务已被他人处理，刷新剔除并清空详情 */
+async function onCardConflict() {
+  await fetchTasks()
+  selectedThreadId.value = null
+  detailMessages.value = []
 }
 
 // 组件仅在切到审批池 Tab 时挂载，挂载即懒加载（首次点击才发请求）
@@ -177,6 +200,8 @@ defineExpose({ refresh: fetchTasks, activate })
             v-if="message.kind === 'card'"
             :message="message"
             :action-context="makeActionContext(message)"
+            @decided="onCardDecided"
+            @conflict="onCardConflict"
           />
           <p v-else class="text-sm text-gray-700">{{ message.content }}</p>
         </div>

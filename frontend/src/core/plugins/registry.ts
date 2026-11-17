@@ -25,6 +25,16 @@ export interface PluginIdentity {
   role: string
 }
 
+/**
+ * 卡片载荷脱敏器：剔除不应落入本地存储的敏感字段。
+ *
+ * 业务特有字段（签名摘要、许可编号等）的判定规则归属插件，
+ * 核心层只负责在落盘前调用插件提供的脱敏器。
+ */
+export type CardPayloadSanitizer = (
+  payload: Record<string, unknown>,
+) => Record<string, unknown>
+
 /** 插件清单（业务插件自描述） */
 export interface PluginDefinition {
   /** 插件唯一名（须与后端 manifest 的 name 一致） */
@@ -35,6 +45,12 @@ export interface PluginDefinition {
   endpoints: WorkflowEndpoints
   /** 业务卡片：card_type → 组件（注册进通用卡片中枢） */
   cards?: Record<string, Component>
+  /**
+   * 卡片脱敏器：card_type → 脱敏函数。
+   *
+   * 仅作用于本地快照（离线兜底），实时视图与服务端权威数据保持原样。
+   */
+  cardSanitizers?: Record<string, CardPayloadSanitizer>
   /** 业务表单组件（宿主经动态组件渲染） */
   formComponent?: Component
   /** 演示身份（可缺省：生产环境接入企业 IAM 时无需） */
@@ -100,6 +116,19 @@ class PluginRegistryClass {
     this.activeName.value = ''
     this.endpointOverrides.value = {}
     this.identityOverrides.value = {}
+  }
+
+  /**
+   * 取生效插件为某卡片类型注册的脱敏器；未注册返回 undefined。
+   *
+   * core 只调用插件提供的函数，不解释任何业务字段名。
+   */
+  getCardSanitizer(
+    cardType: string,
+  ): CardPayloadSanitizer | undefined {
+    const plugin = this.getActive()
+    if (!plugin) return undefined
+    return plugin.cardSanitizers?.[cardType]
   }
 
   /**

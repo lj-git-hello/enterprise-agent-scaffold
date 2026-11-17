@@ -16,6 +16,8 @@ export interface ChatMessageRecord {
   card_payload: Record<string, unknown> | null
   retry_payload: Record<string, unknown> | null
   created_at: string | null
+  /** 全局单调序号（服务端权威排序依据；本地新建消息可缺省） */
+  seq?: number
 }
 
 /** 卡片交互上下文：卡片动作回调可据此触发重试/上报 */
@@ -55,6 +57,14 @@ export interface TaskSummary {
   current_node: string | null
   /** 列表展示标题（可缺省，回退展示 thread_id） */
   title?: string
+  /** 线程类别：chat=对话线程；task=业务工单线程 */
+  thread_kind?: string
+  /** 创建时间（服务端 ISO 串） */
+  created_at?: string | null
+  /** 更新时间（服务端 ISO 串） */
+  updated_at?: string | null
+  /** 最近活跃时间（服务端 ISO 串） */
+  last_activity_at?: string | null
 }
 
 /**

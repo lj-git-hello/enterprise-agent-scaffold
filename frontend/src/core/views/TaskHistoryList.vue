@@ -2,21 +2,25 @@
 /**
  * TaskHistoryList —— 提报员历史时间线（通用）。
  *
- * 渲染源由外部（工作台 store）经 props.messages 传入；挂载时从 IndexedDB
- * 离线恢复，文本渲染气泡，卡片经 MessageCardHost；消息变更防抖持久化。
+ * 只渲染外部传入的 props.messages：消息来源由工作台 store 统一裁决
+ * （服务端优先，本地快照仅作离线兜底），本视图**不再自行从 IndexedDB
+ * 恢复**——否则会用本地数据覆盖服务端权威流。
  */
-import { onMounted } from 'vue'
-
 import MessageCardHost from '../a2ui/MessageCardHost.vue'
 import type { CardActionContext, ChatMessageRecord } from '../a2ui/types'
-import { loadMessages } from '../engine/storage'
 import { renderMarkdown } from '@/core/utils/markdown'
 
-const props = defineProps<{
+defineProps<{
   sessionId: string
   currentUserId: string
   /** 外部响应式消息列表（store 持有） */
   messages: ChatMessageRecord[]
+}>()
+
+/** 卡片动作事件上抛（宿主据此刷新左栏 / 剔除失效项） */
+const emit = defineEmits<{
+  decided: [permitted: boolean]
+  conflict: []
 }>()
 
 // 卡片动作上下文（dispatch 占位，业务动作后续注入）
@@ -31,15 +35,6 @@ function makeActionContext(message: ChatMessageRecord): CardActionContext {
 function textHtml(message: ChatMessageRecord): string {
   return renderMarkdown(message.content ?? '')
 }
-
-async function hydrate() {
-  const stored = await loadMessages<ChatMessageRecord[]>(props.sessionId)
-  if (stored) props.messages.splice(0, props.messages.length, ...stored)
-}
-
-// 持久化责任已收敛到 useWorkbenchStore（避免切换 Tab 时漏写），
-// 本视图只负责离线恢复与渲染。
-onMounted(hydrate)
 </script>
 
 <template>
@@ -62,6 +57,8 @@ onMounted(hydrate)
         <MessageCardHost
           :message="message"
           :action-context="makeActionContext(message)"
+          @decided="(permitted: boolean) => emit('decided', permitted)"
+          @conflict="emit('conflict')"
         />
       </div>
 

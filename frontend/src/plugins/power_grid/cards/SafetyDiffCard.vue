@@ -12,6 +12,7 @@ import { useWorkflowAction } from '@/core/composables/useWorkflowAction'
 import { useCurrentUser } from '@/core/composables/useCurrentUser'
 import type { ChatMessageRecord } from '@/core/a2ui/types'
 import { PluginRegistry } from '@/core/plugins/registry'
+import { useWorkbenchStore } from '@/core/workbench/useWorkbenchStore'
 
 const props = defineProps<{
   message: ChatMessageRecord
@@ -46,6 +47,7 @@ const ROLE_DISPATCHER = 'DISPATCHER'
 
 const { isSubmitting, notice, submitAudit } = useWorkflowAction()
 const { hasAnyRole } = useCurrentUser()
+const workbench = useWorkbenchStore()
 
 /** 仅调度长可核签；提报员只读，按钮禁用。 */
 const canAudit = computed(() => hasAnyRole(ROLE_DISPATCHER))
@@ -62,8 +64,11 @@ async function decide(permitted: boolean) {
       approved: permitted,
       opinion: permitted ? '核准许可' : '驳回修改',
     },
-    // 成功
-    () => emit('decided', permitted),
+    // 成功：通知父级 + 标记左栏陈旧（终态与锁版本以服务端为准）
+    () => {
+      emit('decided', permitted)
+      workbench.markConversationsStale()
+    },
     // 409：轻提示并让父级移除该失效项
     () => emit('conflict'),
   )

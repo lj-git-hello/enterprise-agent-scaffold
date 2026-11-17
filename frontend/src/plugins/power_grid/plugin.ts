@@ -40,6 +40,28 @@ export const POWER_IDENTITIES: PluginIdentity[] = [
   { id: 'dispatcher_lead', label: '王调度长', role: POWER_ROLE_DISPATCHER },
 ]
 
+/**
+ * permit_result 卡片脱敏器：剔除 CA 签名摘要与调度令编号。
+ *
+ * 本地快照可能被同机其它使用者读取（共享终端场景），
+ * 凭据类材料不得留存于浏览器存储。
+ * 哪些字段敏感属业务知识，判定规则留在插件层，核心层只负责调用。
+ */
+function sanitizePermitResult(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const permitInfo = payload.permit_info
+  if (!permitInfo || typeof permitInfo !== 'object') {
+    return payload
+  }
+  const sanitized: Record<string, unknown> = {
+    ...(permitInfo as Record<string, unknown>),
+  }
+  delete sanitized.ca_signature_hash
+  delete sanitized.permit_no
+  return { ...payload, permit_info: sanitized }
+}
+
 /** 插件清单（由 main.ts 的 import.meta.glob 自动装载） */
 export const plugin: PluginDefinition = {
   name: POWER_PLUGIN_NAME,
@@ -56,6 +78,9 @@ export const plugin: PluginDefinition = {
   },
   formComponent: SubstationApplyForm,
   identities: POWER_IDENTITIES,
+  cardSanitizers: {
+    permit_result: sanitizePermitResult,
+  },
 }
 
 export { SubstationApplyForm }
