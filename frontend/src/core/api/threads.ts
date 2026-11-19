@@ -34,6 +34,8 @@ export interface ThreadListParams {
   session_id?: string
   /** 是否包含已归档线程 */
   include_archived?: boolean
+  /** 标题关键字（大小写不敏感的子串匹配） */
+  q?: string
   limit?: number
   offset?: number
 }
@@ -42,6 +44,8 @@ export interface ThreadListParams {
 export interface ThreadListResponse {
   items: TaskSummary[]
   has_more: boolean
+  /** 过滤后的可见条目总数 */
+  total?: number
   server_time: string
 }
 

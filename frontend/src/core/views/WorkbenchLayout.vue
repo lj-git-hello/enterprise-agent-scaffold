@@ -89,6 +89,12 @@ async function activateIdentity(userId: string): Promise<void> {
     // 切换身份：清理前一身份在本机的缓存分区（共享终端安全）
     if (previousId && previousId !== userId) {
       await clearUserPartition(previousId)
+      // 换人：搜索条件一并清空（store 侧亦会重置查询与分页位点）
+      searchInput.value = ''
+      if (searchTimer) {
+        clearTimeout(searchTimer)
+        searchTimer = null
+      }
     }
     await loginAs(userId)
     // 同步身份供深层卡片做权限判定
@@ -201,6 +207,49 @@ async function handleApplied(result: ApplyResult) {
 async function refreshList() {
   await workbench.refreshConversations(currentIdentity.value.id)
 }
+
+// ---- 左栏会话列表：标题搜索 + 分页折叠 ----
+
+/** 搜索框的即时值（与 store 中已生效的查询条件相互独立） */
+const searchInput = ref<string>('')
+
+/** 搜索防抖时长（毫秒）：避免逐字符触发后端查询 */
+const SEARCH_DEBOUNCE_MS = 300
+
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 输入即搜（防抖）；清空输入同样触发查询，回到完整列表 */
+function onSearchInput() {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    searchTimer = null
+    void workbench.searchConversations(searchInput.value)
+  }, SEARCH_DEBOUNCE_MS)
+}
+
+/** 回车立即提交当前关键字（跳过剩余防抖时间） */
+function submitSearch() {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  void workbench.searchConversations(searchInput.value)
+}
+
+/** 左栏计数文案：过滤后显示匹配数，未过滤显示总数 */
+const conversationCountText = computed(() => {
+  const total = workbenchState.conversationTotal
+  if (workbenchState.conversationQuery) return `匹配 ${total} 条`
+  return `共 ${total} 条`
+})
+
+/** "显示更多"按钮上的剩余条数 */
+const remainingCount = computed(() =>
+  Math.max(
+    0,
+    workbenchState.conversationTotal - workbenchState.conversationFetched,
+  ),
+)
 
 // 会话集合被标记陈旧（审批完成 / 提报成功）→ 与服务端对齐一次
 watch(
@@ -381,6 +430,10 @@ onBeforeUnmount(() => {
   abortController?.abort()
   ticker?.clear()
   ticker = null
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
   window.removeEventListener('online', handleOnline)
 })
 
@@ -468,6 +521,13 @@ onMounted(async () => {
           </button>
         </div>
 
+        <!-- 标题搜索：置于滚动容器之外，列表滚动时保持可见 -->
+        <div v-if="activeTab === 'history'" class="border-b px-3 py-2">
+          <input v-model="searchInput" type="search" placeholder="搜索会话标题"
+            class="w-full rounded-md border border-gray-200 px-2 py-1 text-xs outline-none focus:border-blue-400"
+            @input="onSearchInput" @keyup.enter="submitSearch" />
+        </div>
+
         <!-- 列表树：Tab1 渲染【我的会话】集合 -->
         <div class="flex-1 overflow-y-auto p-3">
           <template v-if="activeTab === 'history'">
@@ -475,14 +535,18 @@ onMounted(async () => {
               <span class="text-[10px] text-gray-400">
                 {{ conversationSourceBadge || '服务端权威数据' }}
               </span>
-              <button type="button" title="从服务端刷新列表" class="text-gray-400 hover:text-blue-600"
-                @click="refreshList">
-                <RefreshCw class="h-3 w-3" />
-              </button>
+              <div class="flex items-center gap-2">
+                <span class="text-[10px] text-gray-400">{{ conversationCountText }}</span>
+                <button type="button" title="从服务端刷新列表" class="text-gray-400 hover:text-blue-600"
+                  @click="refreshList">
+                  <RefreshCw class="h-3 w-3" />
+                </button>
+              </div>
             </div>
 
             <p v-if="workbenchState.conversationList.length === 0" class="text-xs text-gray-400">
-              暂无会话，可在右侧填报发起
+              <template v-if="searchInput.trim()">未匹配到「{{ searchInput.trim() }}」</template>
+              <template v-else>暂无会话，可在右侧填报发起</template>
             </p>
 
             <button v-for="item in workbenchState.conversationList" :key="item.thread_id" type="button"
@@ -504,6 +568,14 @@ onMounted(async () => {
                   Lock: v{{ item.lock_version }}
                 </span>
               </div>
+            </button>
+
+            <!-- 显示更多：服务端仍有未加载条目时按页追加 -->
+            <button v-if="workbenchState.conversationHasMore && workbenchState.conversationSource === 'server'"
+              type="button"
+              class="mt-1 w-full rounded-md border border-dashed border-gray-300 py-1.5 text-xs text-gray-500 transition hover:bg-gray-50"
+              @click="workbench.loadMoreConversations()">
+              显示更多（还有 {{ remainingCount }} 条）
             </button>
           </template>
 
