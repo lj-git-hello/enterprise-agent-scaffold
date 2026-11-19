@@ -44,6 +44,7 @@ async def list_threads(
     kind: str = Query("all", description="线程类别：all=全部；task=排除对话线程"),
     session_id: str | None = Query(None, description="限定某一会话"),
     include_archived: bool = Query(False, description="是否包含已归档线程"),
+    q: str | None = Query(None, description="标题关键字（大小写不敏感的子串匹配）"),
     limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT),
     offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
@@ -52,6 +53,11 @@ async def list_threads(
 
     可见性由 core 统一判定（发起人 / 实际处理人 / 待办责任人三命中其一），
     无权即不可见 —— 不返回 403，避免暴露"存在但无权"这一事实。
+
+    q 非空时按展示标题过滤（大小写不敏感，子串匹配）。
+
+    total 为过滤后的可见条目总数。本页为空时窗口函数无行可取，total 取 0；
+    该情形下 has_more 同样为 false，客户端据此判定"已到末页"。
     """
     if kind not in _ALLOWED_KINDS:
         raise HTTPException(
@@ -67,13 +73,23 @@ async def list_threads(
         kind=kind,
         session_id=session_id,
         include_archived=include_archived,
+        q=q,
         limit=limit + 1,
         offset=offset,
     )
     has_more = len(rows) > limit
+    # total_count 由 SQL 窗口函数给出，各行取值一致，取首行即可
+    total = int(rows[0].get("total_count") or 0) if rows else 0
+    # total_count 是 SQL 层产物，不进对外契约（总数由顶层 total 承载）
+    items = []
+    for row in rows[:limit]:
+        item = dict(row)
+        item.pop("total_count", None)
+        items.append(item)
     return {
-        "items": rows[:limit],
+        "items": items,
         "has_more": has_more,
+        "total": total,
         "server_time": _now_iso(),
     }
 

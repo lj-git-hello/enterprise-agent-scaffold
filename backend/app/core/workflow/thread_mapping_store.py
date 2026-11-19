@@ -156,6 +156,7 @@ class ThreadMappingStore:
         kind: str = "all",
         session_id: str | None = None,
         include_archived: bool = False,
+        q: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -167,40 +168,56 @@ class ThreadMappingStore:
         thread_kind 由命名空间前缀推导（chat_ 前缀为对话线程），不新增业务语义列。
         title 为解析后的展示标题：title 列 → 首条文本消息前 60 字 → thread_id。
         last_activity_at 取该线程最后一条消息时间，供列表按"最近活跃"排序。
+
+        q 非空时按**展示标题**做大小写不敏感的子串过滤（匹配展示标题而非
+        title 列，保证两条来源的标题都可被检索到）。使用 strpos 而非 ILIKE：
+        strpos 无通配符语义，用户输入的 % _ \ 一律按字面量处理，无需转义。
+
+        返回的每一行附带 total_count：过滤后的可见条目总数（窗口函数，
+        在 WHERE 之后求值）。offset 越界导致空结果页时无行可取，total_count
+        亦随之缺失，调用方按缺省 0 处理。
         """
         sql = text(
-            "SELECT t.thread_id, t.session_id, t.creator_id, t.creator_role, "
-            "t.assigned_role, t.status, t.lock_version, t.current_node, "
-            "t.created_at, t.updated_at, "
-            "CASE WHEN t.thread_id LIKE 'chat\\_%' THEN 'chat' ELSE 'task' END "
-            "AS thread_kind, "
-            "COALESCE( "
-            "  NULLIF(t.title, ''), "
-            "  NULLIF((SELECT left(m.content, 60) "
-            "          FROM ai_chat_messages m "
-            "          WHERE m.thread_id = t.thread_id "
-            "            AND m.kind = 'text' "
-            "            AND m.content IS NOT NULL AND m.content <> '' "
-            "          ORDER BY m.seq LIMIT 1), ''), "
-            "  t.thread_id "
-            ") AS title, "
-            "COALESCE(a.last_activity, t.created_at) AS last_activity_at "
-            "FROM ai_thread_mappings t "
-            "LEFT JOIN LATERAL ( "
-            "  SELECT max(m.created_at) AS last_activity "
-            "  FROM ai_chat_messages m "
-            "  WHERE m.thread_id = t.thread_id "
-            ") a ON TRUE "
-            "WHERE (CAST(:include_archived AS boolean) OR t.is_archived = false) "
-            "  AND (t.creator_id = :uid "
-            "       OR t.operator_id = :uid "
-            "       OR (t.assigned_role <> :system_role "
-            "           AND t.assigned_role = :role)) "
-            "  AND (CAST(:session_id AS text) IS NULL "
-            "       OR t.session_id = :session_id) "
-            "  AND (CAST(:kind AS text) <> 'task' "
-            "       OR t.thread_id NOT LIKE 'chat\\_%') "
-            "ORDER BY COALESCE(a.last_activity, t.created_at) DESC, t.thread_id DESC "
+            # 内层 CTE 统一解析展示标题与最近活跃时间，外层只做过滤与分页，
+            # 避免同一套标题表达式在 WHERE 中重复书写。
+            "WITH visible AS ( "
+            "  SELECT t.thread_id, t.session_id, t.creator_id, t.creator_role, "
+            "         t.assigned_role, t.status, t.lock_version, t.current_node, "
+            "         t.created_at, t.updated_at, "
+            "         CASE WHEN t.thread_id LIKE 'chat\\_%' THEN 'chat' "
+            "              ELSE 'task' END AS thread_kind, "
+            "         COALESCE( "
+            "           NULLIF(t.title, ''), "
+            "           NULLIF((SELECT left(m.content, 60) "
+            "                   FROM ai_chat_messages m "
+            "                   WHERE m.thread_id = t.thread_id "
+            "                     AND m.kind = 'text' "
+            "                     AND m.content IS NOT NULL AND m.content <> '' "
+            "                   ORDER BY m.seq LIMIT 1), ''), "
+            "           t.thread_id "
+            "         ) AS title, "
+            "         COALESCE(a.last_activity, t.created_at) AS last_activity_at "
+            "  FROM ai_thread_mappings t "
+            "  LEFT JOIN LATERAL ( "
+            "    SELECT max(m.created_at) AS last_activity "
+            "    FROM ai_chat_messages m "
+            "    WHERE m.thread_id = t.thread_id "
+            "  ) a ON TRUE "
+            "  WHERE (CAST(:include_archived AS boolean) OR t.is_archived = false) "
+            "    AND (t.creator_id = :uid "
+            "         OR t.operator_id = :uid "
+            "         OR (t.assigned_role <> :system_role "
+            "             AND t.assigned_role = :role)) "
+            "    AND (CAST(:session_id AS text) IS NULL "
+            "         OR t.session_id = :session_id) "
+            "    AND (CAST(:kind AS text) <> 'task' "
+            "         OR t.thread_id NOT LIKE 'chat\\_%') "
+            ") "
+            "SELECT *, count(*) OVER () AS total_count "
+            "FROM visible "
+            "WHERE (CAST(:q AS text) IS NULL "
+            "       OR strpos(lower(title), lower(CAST(:q AS text))) > 0) "
+            "ORDER BY last_activity_at DESC, thread_id DESC "
             "LIMIT CAST(:limit AS integer) OFFSET CAST(:offset AS integer)"
         )
         params: dict[str, Any] = {
@@ -210,6 +227,7 @@ class ThreadMappingStore:
             "kind": kind,
             "session_id": session_id,
             "include_archived": include_archived,
+            "q": (q or "").strip() or None,
             "limit": max(1, min(limit, 500)),
             "offset": max(0, offset),
         }
