@@ -16,10 +16,18 @@ from sqlalchemy import text
 
 from app.core.database import AsyncSessionLocal
 from app.core.workflow.graph_registry import DEFAULT_GRAPH_NAME, GraphRegistry
-from app.core.workflow.thread_mapping_store import STATUS_WAITING_HUMAN
+from app.core.workflow.thread_mapping_store import (
+    IN_FLIGHT_STATUSES,
+    STATUS_RUNNING,
+    STATUS_WAITING_HUMAN,
+)
+from app.core.workflow.trace_recorder import TraceRecorder
 
-# 通用状态常量（禁止魔法值）
-STATUS_RUNNING = "RUNNING"
+# 通用状态常量（禁止魔法值）：STATUS_RUNNING 由 thread_mapping_store 统一定义，
+# 此处仅做再导出，供历史引用方保持兼容。
+
+# 图恢复失败时的留痕节点名（业务中立措辞：core 层零业务词汇要求）
+TRACE_NODE_RESUME_FAILED = "workflow.resume_failed"
 
 
 class HITLController:
@@ -69,10 +77,20 @@ class HITLController:
 
         # 依赖反转：从注册中心取当前业务图，底座不感知具体业务
         graph = GraphRegistry.get_graph(graph_name)
-        await graph.ainvoke(
-            Command(resume=resume_payload),
-            config={"configurable": {"thread_id": thread_id}},
-        )
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            await graph.ainvoke(Command(resume=resume_payload), config=config)
+        except Exception as exc:  # noqa: BLE001 —— 失败必须留痕并上抛
+            # CAS 与图恢复分属两个事务：图恢复失败时线程已被置为 RUNNING，
+            # 若就此返回将永久滞留中间态。底座只负责"留痕 + 上抛"——
+            # 是否仍可保持终态由业务插件按自身语义判定（插件可能已产出
+            # 不可逆的终态产物），底座无权代为决定，故不擅自改写状态。
+            await TraceRecorder.record(
+                thread_id,
+                TRACE_NODE_RESUME_FAILED,
+                error_log=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
     @staticmethod
     async def get_pending_tasks(assigned_role: str) -> list[dict[str, Any]]:
@@ -109,28 +127,47 @@ class HITLController:
         thread_id: str,
         final_status: str,
         signature_hash: str | None = None,
-    ) -> None:
-        """流程结束后回写映射终态；可选落签名哈希。"""
+        operator_id: str | None = None,
+        audit_opinion: str | None = None,
+    ) -> bool:
+        """流程结束后回写映射终态；返回是否真正落库。
+
+        【终态守卫】只有仍在途的线程才接受终态回写：当前状态属于通用在途
+        集合（DRAFT / ACTIVE / IN_PROGRESS / RUNNING / WAITING_HUMAN），
+        或已等于目标终态（幂等重写）时才写入。已被他人终结的线程不再被
+        覆盖 —— 首次终态写入生效，迟到的请求无法把已定的结论改回去。
+
+        仅回写传入的字段：未传者保持原值不变（避免覆盖 CAS 阶段已写入的内容）。
+        """
+        # 赋值片段全部来自本模块字面量，不含外部输入，无注入风险
+        assignments = ["status = :status"]
+        params: dict[str, Any] = {"status": final_status, "tid": thread_id}
+        if signature_hash is not None:
+            assignments.append("signature_hash = :sig")
+            params["sig"] = signature_hash
+        if operator_id is not None:
+            assignments.append("operator_id = :uid")
+            params["uid"] = operator_id
+        if audit_opinion is not None:
+            assignments.append("audit_opinion = :opinion")
+            params["opinion"] = audit_opinion
+
         async with AsyncSessionLocal() as session:
-            if signature_hash is not None:
-                await session.execute(
-                    text(
-                        "UPDATE ai_thread_mappings "
-                        "SET status = :status, signature_hash = :sig "
-                        "WHERE thread_id = :tid"
-                    ),
-                    {
-                        "status": final_status,
-                        "sig": signature_hash,
-                        "tid": thread_id,
-                    },
-                )
-            else:
-                await session.execute(
-                    text(
-                        "UPDATE ai_thread_mappings SET status = :status "
-                        "WHERE thread_id = :tid"
-                    ),
-                    {"status": final_status, "tid": thread_id},
-                )
+            result = await session.execute(
+                text(
+                    f"UPDATE ai_thread_mappings SET {', '.join(assignments)} "
+                    "WHERE thread_id = :tid "
+                    "AND (status = :status "
+                    "     OR status = ANY(CAST(:in_flight AS text[])))"
+                ),
+                {**params, "in_flight": list(IN_FLIGHT_STATUSES)},
+            )
             await session.commit()
+            return result.rowcount > 0
+
+
+__all__ = [
+    "STATUS_RUNNING",
+    "TRACE_NODE_RESUME_FAILED",
+    "HITLController",
+]

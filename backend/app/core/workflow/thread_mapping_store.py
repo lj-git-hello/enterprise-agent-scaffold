@@ -20,8 +20,25 @@ STATUS_DRAFT = "DRAFT"
 STATUS_ACTIVE = "ACTIVE"
 # 通用挂起状态（等待人工介入）
 STATUS_WAITING_HUMAN = "WAITING_HUMAN"
+# 通用进行中状态（流程已启动、尚未落到挂起态或终态）
+STATUS_IN_PROGRESS = "IN_PROGRESS"
+# 通用运行中状态（CAS 抢占成功、状态机恢复执行期间）
+STATUS_RUNNING = "RUNNING"
+# 通用失败终态（流程异常终止，核心层兜底用）
+STATUS_FAILED = "FAILED"
 # 通用兜底角色（无状态机的纯对话线程）
 ROLE_SYSTEM = "SYSTEM"
+
+# 在途状态集合：线程处于这些状态说明流程仍在进行，终态回写应当生效。
+# 其它状态一律视为"已被他人终结"，终态回写不再覆盖 —— 首次终态写入生效，
+# 杜绝迟到的请求把已定的结论改回去。
+IN_FLIGHT_STATUSES = (
+    STATUS_DRAFT,
+    STATUS_ACTIVE,
+    STATUS_IN_PROGRESS,
+    STATUS_RUNNING,
+    STATUS_WAITING_HUMAN,
+)
 
 # 聊天线程命名空间前缀（通用层约定：与业务工单线程天然隔离）。
 # 本模块是 thread_id 语义的权威定义处，其它模块一律从此导入，勿重复定义。
@@ -79,6 +96,58 @@ class ThreadMappingStore:
                     return existing
                 raise
             return mapping
+
+    @staticmethod
+    async def update_status(thread_id: str, status: str) -> bool:
+        """回写线程状态；返回是否命中记录。
+
+        status 语义由业务插件定义，核心层只当不透明字符串存取。
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE ai_thread_mappings SET status = :status "
+                    "WHERE thread_id = :tid"
+                ),
+                {"status": status, "tid": thread_id},
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    @staticmethod
+    async def update_current_node(thread_id: str, node_name: str | None) -> bool:
+        """回写状态机当前节点指针；返回是否命中记录。
+
+        node_name 为 None 表示清空指针（流程已终结，不再停留在任何节点上）。
+        节点名语义由业务插件定义，核心层只当不透明字符串存取。
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE ai_thread_mappings SET current_node = :node "
+                    "WHERE thread_id = :tid"
+                ),
+                {"node": node_name, "tid": thread_id},
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    @staticmethod
+    async def update_biz_order_id(thread_id: str, biz_order_id: str | None) -> bool:
+        """回写外部业务单号（弱引用）；返回是否命中记录。
+
+        biz_order_id 是外部系统的单据标识，核心层只当不透明字符串存取。
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE ai_thread_mappings SET biz_order_id = :biz "
+                    "WHERE thread_id = :tid"
+                ),
+                {"biz": biz_order_id, "tid": thread_id},
+            )
+            await session.commit()
+            return result.rowcount > 0
 
     @staticmethod
     async def archive(thread_id: str) -> bool:
@@ -258,6 +327,7 @@ class ThreadMappingStore:
                 "status": mapping.status,
                 "lock_version": mapping.lock_version,
                 "current_node": mapping.current_node,
+                "biz_order_id": mapping.biz_order_id,
                 "title": mapping.title,
                 "is_archived": mapping.is_archived,
                 "created_at": (
@@ -275,9 +345,13 @@ class ThreadMappingStore:
 
 __all__ = [
     "CHAT_THREAD_PREFIX",
+    "IN_FLIGHT_STATUSES",
     "ROLE_SYSTEM",
     "STATUS_ACTIVE",
     "STATUS_DRAFT",
+    "STATUS_FAILED",
+    "STATUS_IN_PROGRESS",
+    "STATUS_RUNNING",
     "STATUS_WAITING_HUMAN",
     "THREAD_KIND_CHAT",
     "THREAD_KIND_TASK",
