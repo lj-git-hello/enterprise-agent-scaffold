@@ -65,6 +65,10 @@ class CheckpointerManager:
         self.saver: AsyncPostgresSaver | None = None
 
     async def init_pool(self):
+        # 重建前先释放旧池：直接覆盖 self.pool 会让旧池的连接与事务一起泄漏，
+        # 既耗尽数据库连接，也会持锁阻塞后续 setup() 的建表 DDL。
+        await self.close_pool()
+
         # 建立独立连接池，防止与业务大事务/向量索引查询产生死锁
         self.pool = AsyncConnectionPool(
             conninfo=self.conn_string,
@@ -74,7 +78,7 @@ class CheckpointerManager:
             kwargs={"autocommit": True}
         )
         await self.pool.open()
-        
+
         # 实例化 AsyncPostgresSaver 并执行自动建表（checkpoints, checkpoint_blobs, checkpoint_writes）
         self.saver = AsyncPostgresSaver(self.pool)
         await self.saver.setup()
@@ -82,5 +86,7 @@ class CheckpointerManager:
     async def close_pool(self):
         if self.pool:
             await self.pool.close()
+            self.pool = None
+            self.saver = None
 
 checkpointer_manager = CheckpointerManager(PSYCOPG_DB_URL)
