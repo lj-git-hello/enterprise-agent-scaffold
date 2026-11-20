@@ -3,20 +3,29 @@
 ## 一、 架构全景与物理边界（Core + Plugin 双层隔离）
 - **核心设计哲学**：**通用底座（`app/core/`）只认契约与状态，零硬编码业务细节；新增垂直业务 = 新增独立插件目录（含 `plugin.py` 暴露 `PLUGIN` 清单），底座零改动。**
 - **工程目录拓扑**：
-  - **前端 (`frontend/`)**：Vue 3 + TypeScript + Vite + Pinia + `<script setup lang="ts">`，三栏响应式工作台（对话流 / A2UI 动态卡片渲染 / 角色审批待办池），本地 `localforage` 离线兜底快照（服务端为权威源）。
+  - **前端 (`frontend/`)**：Vue 3 + TypeScript + Vite + `<script setup lang="ts">`，三栏响应式工作台（对话流 / A2UI 动态卡片渲染 / 角色审批待办池），本地 `localforage` 离线兜底快照（服务端为权威源）。**无 `vue-router`、无 `pinia`**：页面切换靠组件内部 `ref`，全局状态是 `core/workbench/useWorkbenchStore.ts` 的**模块级 `reactive()` 单例**。
   - **通用底座 (`backend/app/core/`)**：
-    - `workflow/`：全局图注册中心（`GraphRegistry`）、HITL 审批控制器（`HITLController`）、消息快照落库器（`MessageRecorder`）、工单映射存储（`ThreadMappingStore`）。
+    - `workflow/`：全局图注册中心（`GraphRegistry`）、HITL 审批控制器（`HITLController`）、消息快照落库器（`MessageRecorder`）、工单映射存储（`ThreadMappingStore`）、执行留痕写入器（`TraceRecorder`）、进程内状态变更事件总线（`EventBus` / `WORKFLOW_EVENT_BUS`）。
+    - `policy/`：通用风险定级契约（`RiskClassification` / `RiskPolicyProtocol`）—— **只定义"怎么表达定级结论"与"谁来给结论"，不定义任何阈值**。
     - `plugin/`：插件契约定义（`PluginManifest`、`PluginIdentity`）与插件自动发现加载器（`loader.py`）。
     - `database.py` / `llm.py` / `security.py`：PostgreSQL 16 双连接池物理隔离、统一 LLM / Embedding 适配、JWT 签发与外部 IAM 验签边界。
+  - **通用网关端点 (`backend/app/api/v1/workflow.py`)**：`GET /api/v1/workflow/events` —— 跨端状态变更 SSE 推送，事件名业务中立（`workflow.status_changed`）。
   - **垂直业务插件 (`backend/app/plugins/power_grid/`)**：
     - `plugin.py`：唯一公开出口（`__all__ = ["PLUGIN"]`），声明路由前缀、角色常量、演示身份及状态机注册。
     - `graph.py` / `states.py` / `router.py` / `chat.py` / `schemas.py` / `constants.py`：电网检修调度状态机、安规 RAG 对话处理器、接口 DTO 模型。
+    - `policy.py`：电压等级风险定级策略（阈值 `POWER_HUMAN_REVIEW_KV_MIN = 110`，**插件私有常量**）。
     - `adapters/`：传统业务防腐层（Anti-Corruption Layer），通过 PEP 544 `Protocol` 隔离外部 OMS 工单系统与 SCADA 调度许可系统。
   - **存储底座**：PostgreSQL 16 + `psycopg` 异步驱动 + `pgvector` (HNSW 索引) + Alembic 异步迁移。核心业务表：`ai_thread_mappings`（含 `lock_version` 乐观锁）、`ai_chat_messages`（JSONB 卡片快照）、`ai_execution_traces`（全链路审计留痕）、`ai_knowledge_base`（`VECTOR(1024)` + `is_active` 软废止标记）。
 
 ---
 
 ## 二、 电力业务红线与状态机编排规约（Plugin 层规范）
+- **电压等级定级红线（二值判定，无灰区档）**：
+  - **≥ 110kV（含）→ 定级 `HIGH` → 强制人工核签**，进入调度长待办池，走完整人工链路。
+  - **< 110kV → 定级 `LOW` → 自动签发调度许可令**，不进人工审批池，提报员当场拿到许可凭证卡（含现场核验二维码）。
+  - **无法识别 / 越界（空串、非数值、解析失败、`0 < kv > 1000` 之外的值）→ 定级 `UNKNOWN` → 转人工**（fail-closed 保守兜底，绝不因解析失败落到自动放行）。
+  - **不设 `MEDIUM` 灰区档、不设灰度开关**：定级是二值判定，阈值是业务规则而非灰度特性；阈值常量 `POWER_HUMAN_REVIEW_KV_MIN = 110` 属插件私有，**core 层不得出现任何阈值**。
+  - 定级节点 `risk_classify` **必须无副作用**（状态机 resume 时会重放节点，任何写库 / 写外部系统的动作会被执行两次）。
 - **双轨入口解耦**：
   - **自然语言对话入口 (`chat.py`)**：处理日常安规问答与意图识别；涉及《电力安全工作规程》时优先检索 `ai_knowledge_base`（仅限 `is_active=TRUE` 的有效切片），严格依据条款作答并标注出处，严禁无依据脑补。
   - **结构化业务提报入口 (`router.py` -> `POST /apply`)**：派生独立 `thread_id`（`{session_id}_{uuid12}`），写入 `ai_thread_mappings` 建档后驱动 `build_dispatch_graph` 执行。
@@ -24,6 +33,10 @@
   - **节点内动态挂起**：人工审批断点**必须在节点函数内部显式调用 `interrupt()`** 表达，**严禁使用静态 `interrupt_before`**。
   - **防滞留回滚兜底**：`POST /apply` 驱动图执行后必须探查 `bool(snapshot.interrupts)`；若安规初审未通过导致图直接流转至 `END`（未挂起），必须立即调用 `HITLController.finalize_status` 置为终态驳回并执行 `ThreadMappingStore.archive()`，严禁废单滞留在调度长待办池。
   - **并发防重与唤醒**：调度长核签（`AuditRequest`）必须校验 `lock_version`（CAS 乐观锁），通过 `Command(resume=...)` 携带相同 `thread_id` 唤醒状态机流转至 `issue_permit`（签发 SCADA 许可令）或 `END`。
+  - **终态守卫（首次终态写入生效）**：`HITLController.finalize_status` 只对**仍在途**的线程生效（通用在途集合 `DRAFT / ACTIVE / IN_PROGRESS / RUNNING / WAITING_HUMAN`）；已被他人终结的线程不得被迟到的终态回写覆盖。
+  - **图恢复失败兜底（严禁滞留中间态）**：CAS 抢占与图恢复分属两个事务，图恢复抛错时线程已被置为运行中。兜底依据图内**是否已产出终态产物**判定 —— **已产出则保持终态不回退、不置失败，仅补记错误留痕**（不可逆的许可既已生效，回退只会造成"许可已发但单据被驳"的矛盾态）；未产出则置失败终态并留痕。
+  - **审核卡终态一致**：审核卡是**可变视图投影**（`ai_chat_messages.card_payload` + `card_version` 乐观锁），审批结论**原地改写原卡**而非另插新卡；改写前的旧载荷必须写入 `ai_execution_traces`（append-only 真相）。
+  - **跨端状态同步**：状态变更后由插件发布 `workflow.status_changed` 事件（**严格在数据库 `commit()` 之后**调用 `WORKFLOW_EVENT_BUS.publish()`），前端经 SSE 免刷新对齐；core 只做字符串匹配，不理解业务语义。
 - **外部系统防腐隔离**：插件内部严禁直接耦合外部电网数据库或第三方私有 SDK，所有外部交互（IAM 鉴权、OMS 建单、SCADA 许可）必须通过 `adapters/` 下的 `Protocol` 接口调用。
 
 ---
@@ -62,8 +75,10 @@
   - 环境要求：Conda 虚拟环境 `(power-agent)`，Node.js 18+，PostgreSQL 16 服务运行中。
   ```powershell
   # 1. 启动后端服务（位于 backend/ 目录下）
+  #    注意：ASGI 入口是 backend/main.py，模块名是 main（不是 app.main）
+  #    Windows 下必须带 --reload，否则 psycopg 报 ProactorEventLoop 错误
   conda activate power-agent
-  uvicorn app.main:app --reload --port 8000
+  python -m uvicorn main:app --reload --port 8000
 
   # 2. 数据库迁移（位于 backend/ 目录下）
   alembic upgrade head
