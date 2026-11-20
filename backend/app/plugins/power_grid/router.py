@@ -121,6 +121,8 @@ async def _publish_status_changed(
             actor_id=actor_id,
             occurred_at=datetime.now(timezone.utc).isoformat(),
             audience=tuple(sorted(audience)),
+            # 会话归属：会话级列表据此定位到具体会话行
+            session_id=str(mapping.get("session_id") or "") if mapping else "",
         )
     )
 

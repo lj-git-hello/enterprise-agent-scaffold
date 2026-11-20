@@ -45,6 +45,7 @@ class MessageRecorder:
         )
         async with AsyncSessionLocal() as session:
             session.add(message)
+            await _touch_thread_activity(session, thread_id)
             try:
                 await session.commit()
             except IntegrityError:
@@ -75,6 +76,7 @@ class MessageRecorder:
         )
         async with AsyncSessionLocal() as session:
             session.add(message)
+            await _touch_thread_activity(session, thread_id)
             try:
                 await session.commit()
             except IntegrityError:
@@ -151,18 +153,21 @@ class MessageRecorder:
     @staticmethod
     async def get_latest_card(
         thread_id: str,
-        card_type: str,
+        card_type: str | None = None,
     ) -> dict[str, Any] | None:
-        """读取线程内最后一条同类型卡片；无记录返回 None。
+        """读取线程内最后一条卡片；无记录返回 None。
 
-        定位规则与 update_card_payload 一致：``ORDER BY seq DESC NULLS LAST,
-        created_at DESC LIMIT 1``，seq 为 NULL 的存量行排到最后。
+        card_type 为 None 时不限类型，取线程内最新一张卡片；指定类型时取
+        该类型下的最后一条。定位规则与 update_card_payload 一致：
+        ``ORDER BY seq DESC NULLS LAST, created_at DESC LIMIT 1``，
+        seq 为 NULL 的存量行排到最后。
         """
         sql = text(
             "SELECT id, seq, card_type, card_payload, card_version, "
             "created_at, updated_at "
             "FROM ai_chat_messages "
-            "WHERE thread_id = :thread_id AND card_type = :card_type "
+            "WHERE thread_id = :thread_id "
+            "AND (CAST(:card_type AS text) IS NULL OR card_type = :card_type) "
             "ORDER BY seq DESC NULLS LAST, created_at DESC "
             "LIMIT 1"
         )
@@ -175,6 +180,25 @@ class MessageRecorder:
         if row is None:
             return None
         return _to_message_dict(row)
+
+    @staticmethod
+    async def list_latest_cards(thread_id: str) -> list[dict[str, Any]]:
+        """读取线程内每种卡片类型的最新一张；无卡片返回 []。
+
+        只读检视需要一次取全该线程的各类卡片（不同类型的卡片承载不同信息），
+        逐类型查询会退化成 N 次往返，故用 DISTINCT ON 一次取回。
+        定位规则与 get_latest_card 一致：``seq DESC NULLS LAST, created_at DESC``。
+        """
+        sql = text(
+            "SELECT DISTINCT ON (card_type) id, seq, card_type, card_payload, "
+            "       card_version, created_at, updated_at "
+            "FROM ai_chat_messages "
+            "WHERE thread_id = :thread_id AND card_type IS NOT NULL "
+            "ORDER BY card_type, seq DESC NULLS LAST, created_at DESC"
+        )
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(sql, {"thread_id": thread_id})
+        return [_to_message_dict(row) for row in rows]
 
     @staticmethod
     async def list_by_thread(thread_id: str) -> list[dict[str, Any]]:
@@ -227,6 +251,24 @@ class MessageRecorder:
             )
 
         return [_to_message_dict(row) for row in rows]
+
+
+async def _touch_thread_activity(session: Any, thread_id: str) -> None:
+    """提升线程最近活跃时间（与消息写入同事务）。
+
+    ai_chat_messages 的唯一写入口即本模块，故"线程最后活跃时间"可由
+    核心层单点维护，无需业务插件配合。与消息同事务提交：幂等冲突回滚时
+    活跃时间一并回滚，不会产生漂移。
+
+    now() 为事务时间戳，与消息 created_at 的 server_default 同源同值。
+    """
+    await session.execute(
+        text(
+            "UPDATE ai_thread_mappings SET last_activity_at = now() "
+            "WHERE thread_id = :tid"
+        ),
+        {"tid": thread_id},
+    )
 
 
 async def _client_msg_exists(

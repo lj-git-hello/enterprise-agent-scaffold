@@ -3,8 +3,10 @@
 服务端是线程 / 消息的唯一权威源：本模块提供前端渲染所需的读取接口，
 使前端本地存储可以降级为"离线兜底快照"而非主存储。
 
-提供三组读取：
+提供五组读取：
 - GET /api/v1/threads：当前用户可见的线程（会话 / 工单条目）列表
+- GET /api/v1/sessions：按 session_id 聚合的可见会话列表
+- GET /api/v1/threads/{thread_id}：线程只读详情（元信息 + 最新卡片快照）
 - GET /api/v1/threads/{thread_id}/messages：单线程的消息与卡片快照
 - GET /api/v1/sessions/{session_id}/messages：整个会话的消息（跨线程全序）
 
@@ -90,6 +92,82 @@ async def list_threads(
         "items": items,
         "has_more": has_more,
         "total": total,
+        "server_time": _now_iso(),
+    }
+
+
+@thread_router.get("/sessions")
+async def list_sessions(
+    q: str | None = Query(
+        None, description="标题关键字（命中会话内任一可见线程标题）"
+    ),
+    limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """当前用户可见的会话列表（按 session_id 聚合）。
+
+    一个会话框内可产生多条线程（对话线程 + 若干业务线程），本端点按会话
+    聚合为一行，避免同一会话在列表里重复出现。
+
+    代表态 status 为业务线程优先：组内存在任务线程时取其中最近活跃者的
+    状态，否则取对话线程的状态。related_count 为组内任务线程数，
+    thread_count 为组内线程总数。q 命中组内任一可见线程标题即算命中。
+
+    可见性仍逐线程判定，会话可见 = 组内至少一条可见线程。
+
+    分页落在聚合之后：total 为会话总数。本页为空时窗口函数无行可取，
+    total 取 0。
+    """
+    user_id = current_user["sub"]
+    user_role = current_user.get("role") or ""
+    # 多取一条用于判断 has_more
+    rows = await ThreadMappingStore.list_sessions(
+        user_id,
+        user_role,
+        q=q,
+        limit=limit + 1,
+        offset=offset,
+    )
+    has_more = len(rows) > limit
+    total = int(rows[0].get("total_count") or 0) if rows else 0
+    items = []
+    for row in rows[:limit]:
+        item = dict(row)
+        item.pop("total_count", None)
+        items.append(item)
+    return {
+        "items": items,
+        "has_more": has_more,
+        "total": total,
+        "server_time": _now_iso(),
+    }
+
+
+@thread_router.get("/threads/{thread_id}")
+async def get_thread_detail(
+    thread_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """线程只读详情（线程元信息 + 卡片快照）。
+
+    可见性由 core 统一判定，不可见与不存在统一 404。
+    本端点严格只读：不写库、不改状态、不触发任何外部系统。
+
+    card 为线程内最新一张卡片（不限类型）；cards 为线程内每种卡片类型的
+    最新一张 —— 只读检视需要一次取全不同类型的卡片信息。
+    """
+    mapping = await assert_thread_visible(
+        thread_id,
+        current_user["sub"],
+        current_user.get("role") or "",
+    )
+    card = await MessageRecorder.get_latest_card(thread_id)
+    cards = await MessageRecorder.list_latest_cards(thread_id)
+    return {
+        "thread": mapping,
+        "card": card,
+        "cards": cards,
         "server_time": _now_iso(),
     }
 

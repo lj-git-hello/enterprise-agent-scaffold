@@ -99,6 +99,14 @@ class AIThreadMapping(Base):
         onupdate=func.now(),
         nullable=False,
     )
+    # 线程最近活跃时间（物化列）：由核心层在写消息 / 推进工作流状态时维护，
+    # 供会话级聚合排序与 (creator_id, session_id, last_activity_at DESC)
+    # 复合索引使用。存量数据由迁移按 max(ai_chat_messages.created_at) 回填。
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class AIChatMessage(Base):

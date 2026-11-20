@@ -53,7 +53,8 @@ class HITLController:
                     "SET status = :running, "
                     "lock_version = lock_version + 1, "
                     "operator_id = :uid, "
-                    "audit_opinion = :opinion "
+                    "audit_opinion = :opinion, "
+                    "last_activity_at = now() "
                     "WHERE thread_id = :tid "
                     "AND lock_version = :ver "
                     "AND status = :waiting"
@@ -140,7 +141,8 @@ class HITLController:
         仅回写传入的字段：未传者保持原值不变（避免覆盖 CAS 阶段已写入的内容）。
         """
         # 赋值片段全部来自本模块字面量，不含外部输入，无注入风险
-        assignments = ["status = :status"]
+        # 状态推进属实质活动，同步提升线程最近活跃时间
+        assignments = ["status = :status", "last_activity_at = now()"]
         params: dict[str, Any] = {"status": final_status, "tid": thread_id}
         if signature_hash is not None:
             assignments.append("signature_hash = :sig")

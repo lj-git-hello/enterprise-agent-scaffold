@@ -2,7 +2,7 @@
 
 底座只提供"事件如何流动"的能力，不理解任何业务语义：
 - 事件载荷字段一律业务中立：event / thread_id / status / actor_id /
-  occurred_at / audience；
+  occurred_at / audience / session_id；
 - 订阅者以 user_id 与 role 标识，受众命中规则为纯字符串比较；
 - 受众为空表示不限受众（广播）。
 
@@ -35,6 +35,10 @@ class WorkflowEvent:
     occurred_at: str
     """受众标识集合（user_id 或 role）；为空表示不限受众。"""
     audience: tuple[str, ...] = ()
+    """会话标识（线程的会话归属）；为空表示未知。
+    会话级列表（按 session_id 聚合）据此把事件定位到具体会话，
+    无此字段则前端无法命中会话，只能退化为整表刷新。"""
+    session_id: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         """转为可 JSON 序列化的载荷。"""
@@ -45,6 +49,7 @@ class WorkflowEvent:
             "actor_id": self.actor_id,
             "occurred_at": self.occurred_at,
             "audience": list(self.audience),
+            "session_id": self.session_id,
         }
 
 

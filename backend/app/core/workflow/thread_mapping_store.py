@@ -102,11 +102,13 @@ class ThreadMappingStore:
         """回写线程状态；返回是否命中记录。
 
         status 语义由业务插件定义，核心层只当不透明字符串存取。
+        状态推进属于实质活动，同步提升线程最近活跃时间。
         """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
-                    "UPDATE ai_thread_mappings SET status = :status "
+                    "UPDATE ai_thread_mappings SET status = :status, "
+                    "last_activity_at = now() "
                     "WHERE thread_id = :tid"
                 ),
                 {"status": status, "tid": thread_id},
@@ -236,7 +238,8 @@ class ThreadMappingStore:
 
         thread_kind 由命名空间前缀推导（chat_ 前缀为对话线程），不新增业务语义列。
         title 为解析后的展示标题：title 列 → 首条文本消息前 60 字 → thread_id。
-        last_activity_at 取该线程最后一条消息时间，供列表按"最近活跃"排序。
+        last_activity_at 取线程最近活跃时间（物化列，由写消息 / 状态推进维护），
+        供列表按"最近活跃"排序。
 
         q 非空时按**展示标题**做大小写不敏感的子串过滤（匹配展示标题而非
         title 列，保证两条来源的标题都可被检索到）。使用 strpos 而非 ILIKE：
@@ -265,13 +268,8 @@ class ThreadMappingStore:
             "                   ORDER BY m.seq LIMIT 1), ''), "
             "           t.thread_id "
             "         ) AS title, "
-            "         COALESCE(a.last_activity, t.created_at) AS last_activity_at "
+            "         COALESCE(t.last_activity_at, t.created_at) AS last_activity_at "
             "  FROM ai_thread_mappings t "
-            "  LEFT JOIN LATERAL ( "
-            "    SELECT max(m.created_at) AS last_activity "
-            "    FROM ai_chat_messages m "
-            "    WHERE m.thread_id = t.thread_id "
-            "  ) a ON TRUE "
             "  WHERE (CAST(:include_archived AS boolean) OR t.is_archived = false) "
             "    AND (t.creator_id = :uid "
             "         OR t.operator_id = :uid "
@@ -295,6 +293,108 @@ class ThreadMappingStore:
             "system_role": ROLE_SYSTEM,
             "kind": kind,
             "session_id": session_id,
+            "include_archived": include_archived,
+            "q": (q or "").strip() or None,
+            "limit": max(1, min(limit, 500)),
+            "offset": max(0, offset),
+        }
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(sql, params)
+            items = [dict(row._mapping) for row in rows]
+        for item in items:
+            for key in ("created_at", "updated_at", "last_activity_at"):
+                value = item.get(key)
+                if value is not None:
+                    item[key] = value.isoformat()
+        return items
+
+    @staticmethod
+    async def list_sessions(
+        user_id: str,
+        user_role: str,
+        *,
+        q: str | None = None,
+        include_archived: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """按 session_id 聚合列出当前用户可见的会话。
+
+        一个会话框内可产生多条线程（对话线程 + 若干业务线程），左栏按会话
+        聚合为一行，避免同一会话重复出现。
+
+        可见性仍逐线程判定：组内至少一条可见线程即视为会话可见；不上提到
+        会话级，避免泄露他人会话的存在与条数。
+
+        代表态 status：业务线程优先 —— 组内存在任务线程时取其中最近活跃者
+        的状态，否则取对话线程的状态（core 只认 thread_kind，不解释业务语义）。
+        title：组内最早创建的对话线程标题（无对话线程时回落最早线程）。
+        related_count：组内任务线程数；thread_count：组内线程总数。
+
+        分页必须落在聚合之后：窗口函数置于 GROUP BY 外层，total_count 为
+        会话总数而非线程数；q 匹配组内任一可见线程的标题。
+        """
+        sql = text(
+            # 内层 CTE 逐线程判定可见性并解析展示标题；外层按 session_id 聚合，
+            # 代表态与标题均用有序 array_agg 取首条，聚合完成后才做分页。
+            "WITH visible AS ( "
+            "  SELECT t.thread_id, t.session_id, t.status, t.created_at, "
+            "         t.updated_at, "
+            "         CASE WHEN t.thread_id LIKE 'chat\\_%' THEN 'chat' "
+            "              ELSE 'task' END AS thread_kind, "
+            "         COALESCE( "
+            "           NULLIF(t.title, ''), "
+            "           NULLIF((SELECT left(m.content, 60) "
+            "                   FROM ai_chat_messages m "
+            "                   WHERE m.thread_id = t.thread_id "
+            "                     AND m.kind = 'text' "
+            "                     AND m.content IS NOT NULL AND m.content <> '' "
+            "                   ORDER BY m.seq LIMIT 1), ''), "
+            "           t.thread_id "
+            "         ) AS title, "
+            "         COALESCE(t.last_activity_at, t.created_at) AS last_activity_at "
+            "  FROM ai_thread_mappings t "
+            "  WHERE (CAST(:include_archived AS boolean) OR t.is_archived = false) "
+            "    AND (t.creator_id = :uid "
+            "         OR t.operator_id = :uid "
+            "         OR (t.assigned_role <> :system_role "
+            "             AND t.assigned_role = :role)) "
+            "), agg AS ( "
+            "  SELECT session_id, "
+            "         count(*) AS thread_count, "
+            "         count(*) FILTER (WHERE thread_kind = 'task') AS related_count, "
+            "         min(created_at) AS created_at, "
+            "         max(updated_at) AS updated_at, "
+            "         max(last_activity_at) AS last_activity_at, "
+            # 标题：对话线程优先（最早创建的对话标题），再按创建时间取首条
+            "         (array_agg(title "
+            "           ORDER BY (thread_kind <> 'chat'), created_at, thread_id))[1] "
+            "           AS title, "
+            # 代表态：任务线程优先（最近活跃者），再按活跃时间取首条
+            "         (array_agg(status "
+            "           ORDER BY (thread_kind <> 'task'), "
+            "                    last_activity_at DESC, thread_id DESC))[1] "
+            "           AS status, "
+            # 关键字：命中组内任一可见线程标题即算命中
+            "         bool_or(CASE WHEN CAST(:q AS text) IS NULL THEN false "
+            "                      ELSE strpos(lower(title), "
+            "                                  lower(CAST(:q AS text))) > 0 END) "
+            "           AS q_hit "
+            "  FROM visible "
+            "  GROUP BY session_id "
+            ") "
+            "SELECT session_id, title, status, related_count, thread_count, "
+            "       created_at, updated_at, last_activity_at, "
+            "       count(*) OVER () AS total_count "
+            "FROM agg "
+            "WHERE (CAST(:q AS text) IS NULL OR q_hit) "
+            "ORDER BY last_activity_at DESC, session_id DESC "
+            "LIMIT CAST(:limit AS integer) OFFSET CAST(:offset AS integer)"
+        )
+        params: dict[str, Any] = {
+            "uid": user_id,
+            "role": user_role or "",
+            "system_role": ROLE_SYSTEM,
             "include_archived": include_archived,
             "q": (q or "").strip() or None,
             "limit": max(1, min(limit, 500)),
@@ -338,6 +438,11 @@ class ThreadMappingStore:
                 "updated_at": (
                     mapping.updated_at.isoformat()
                     if mapping.updated_at is not None
+                    else None
+                ),
+                "last_activity_at": (
+                    mapping.last_activity_at.isoformat()
+                    if mapping.last_activity_at is not None
                     else None
                 ),
             }
