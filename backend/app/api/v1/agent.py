@@ -23,7 +23,6 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from app.core.database import AsyncSessionLocal
 from app.core.plugin.loader import PluginLoader
 from app.core.plugin.manifest import ChatContext
 from app.core.security import get_current_user
@@ -31,12 +30,12 @@ from app.core.workflow import (
     CHAT_THREAD_PREFIX,
     MessageRecorder,
     ThreadMappingStore,
+    TraceRecorder,
 )
 from app.core.workflow.thread_mapping_store import (
     ROLE_SYSTEM,
     STATUS_ACTIVE,
 )
-from app.models.ai_schema import AIExecutionTrace
 from app.schemas.a2ui import (
     A2UIEventType,
     AgentChatEvent,
@@ -80,7 +79,11 @@ def build_chat_thread_id(thread_id: str) -> str:
 
 
 class TraceWriter:
-    """执行留痕写入器（通用层实现 ai_execution_traces 落库）。"""
+    """执行留痕写入器（通用层实现 ai_execution_traces 落库）。
+
+    落库实现已收口到 core.workflow.TraceRecorder，本类仅保留对话网关的
+    薄封装语义（按线程绑定 node_name）。
+    """
 
     def __init__(self, thread_id: str) -> None:
         self._thread_id = thread_id
@@ -97,23 +100,17 @@ class TraceWriter:
         error_log: str | None = None,
     ) -> None:
         """写入一行节点级留痕；写失败仅告警，不影响主对话链路。"""
-        trace = AIExecutionTrace(
-            thread_id=self._thread_id,
-            node_name=node_name,
+        await TraceRecorder.record(
+            self._thread_id,
+            node_name,
             model_name=model_name,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_cost=total_cost,
             latency_ms=latency_ms,
+            total_cost=total_cost,
             tool_calls=tool_calls,
             error_log=error_log,
         )
-        try:
-            async with AsyncSessionLocal() as session:
-                session.add(trace)
-                await session.commit()
-        except Exception:  # noqa: BLE001 —— 留痕属旁路审计，失败不阻断对话
-            logger.exception("[对话网关] 执行留痕写入失败 node=%s", node_name)
 
 
 def _sse_frame(event_name: str, payload: dict[str, Any]) -> str:

@@ -9,6 +9,7 @@
 - backend/app/schemas/a2ui.py 通用 A2UI 契约
 - backend/app/api/v1/agent.py 通用对话网关
 - backend/app/api/v1/plugin.py 通用插件清单路由
+- backend/app/api/v1/workflow.py 通用工作流事件订阅端点
 - backend/app/services/acl/    防腐层通用契约
 - frontend/src/core/          前端通用底座
 
@@ -35,6 +36,7 @@ SCAN_TARGETS: tuple[Path, ...] = (
     BACKEND_DIR / "app" / "schemas" / "a2ui.py",
     BACKEND_DIR / "app" / "api" / "v1" / "agent.py",
     BACKEND_DIR / "app" / "api" / "v1" / "plugin.py",
+    BACKEND_DIR / "app" / "api" / "v1" / "workflow.py",
     BACKEND_DIR / "app" / "services" / "acl",
     FRONTEND_CORE,
 )
