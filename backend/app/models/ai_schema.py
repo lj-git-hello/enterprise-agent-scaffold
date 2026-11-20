@@ -141,7 +141,17 @@ class AIChatMessage(Base):
     is_sanitized: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False, nullable=False
     )
+    # 卡片视图投影版本：卡片被原地改写时递增，是卡片级乐观锁的依据。
+    # 卡片是可变视图投影（与消息 append-only 语义并存），改写前的旧载荷
+    # 由调用方另写入 ai_execution_traces 留痕（append-only 真相）。
+    card_version: Mapped[int] = mapped_column(
+        Integer, server_default=text("1"), default=1, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 最近一次改写时间：纯文本消息与未改写卡片等于写入时间
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
