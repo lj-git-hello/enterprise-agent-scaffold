@@ -20,3 +20,11 @@ class DispatchState(BaseWorkflowState):
     audit_decision: dict | None
     # SCADA 调度令凭证
     permit_info: dict | None
+    # 风险定级结论（由 risk_classify 节点写入）
+    risk_level: str
+    risk_reason: str
+    # 是否必须人工核签（路由的唯一权威信号）
+    requires_human: bool
+    risk_matched_rules: list[str]
+    # 自动签发标记：无人工决策即走自动签发路径
+    auto_issued: bool
