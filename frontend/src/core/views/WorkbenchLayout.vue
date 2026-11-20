@@ -25,6 +25,7 @@ import TaskHistoryList from './TaskHistoryList.vue'
 import type { TaskSummary } from '../a2ui/types'
 import { chatStream, type StreamStatus } from '../api/agent'
 import { clearToken, http, setToken } from '../api/http'
+import { subscribeWorkflowEvents } from '../api/workflow'
 import { useCurrentUser } from '../composables/useCurrentUser'
 import { RenderTicker } from '../engine/render_ticker'
 import {
@@ -79,6 +80,34 @@ async function loginAs(userId: string) {
 /** 已激活身份（避免重复登录；登录失败后清空以允许重试） */
 let activatedId = ''
 
+// ---- 工作流事件订阅（跨端状态变更实时同步） ----
+// 订阅通道的身份与受众由 JWT 判定，切换身份必须重建订阅，
+// 否则旧身份的订阅会一直收不到属于新身份的事件。
+let workflowAbort: AbortController | null = null
+
+function stopWorkflowSubscription(): void {
+  workflowAbort?.abort()
+  workflowAbort = null
+}
+
+function startWorkflowSubscription(): void {
+  stopWorkflowSubscription()
+  const controller = new AbortController()
+  workflowAbort = controller
+  void subscribeWorkflowEvents(
+    {
+      onStatusChanged: (payload) => {
+        void workbench.handleWorkflowEvent(payload, currentIdentity.value.id)
+      },
+    },
+    controller.signal,
+  ).catch((error) => {
+    // 订阅中断不阻断主流程：对话流与手动刷新仍是权威兜底
+    if (controller.signal.aborted) return
+    console.warn('工作流事件订阅中断：', error)
+  })
+}
+
 async function activateIdentity(userId: string): Promise<void> {
   if (!userId || userId === activatedId) {
     return
@@ -99,6 +128,8 @@ async function activateIdentity(userId: string): Promise<void> {
     await loginAs(userId)
     // 同步身份供深层卡片做权限判定
     setCurrentUser(userId, currentIdentity.value.role)
+    // 订阅工作流事件（JWT 已更新，受众随身份生效）
+    startWorkflowSubscription()
     // 登出后重新登录：会话 ID 已被清空，必须重建一个，
     // 否则新一轮对话会以空 thread_id 提交到服务端。
     if (!workbenchState.activeSessionId) {
@@ -136,6 +167,7 @@ watch(identityId, (userId) => {
 async function logout() {
   const userId = currentIdentity.value.id
   abortController?.abort()
+  stopWorkflowSubscription()
   ticker?.clear()
   ticker = null
   isStreaming.value = false
@@ -428,6 +460,7 @@ async function sendDraft() {
 // 组件卸载时中止在途流，避免回调写入已销毁的状态
 onBeforeUnmount(() => {
   abortController?.abort()
+  stopWorkflowSubscription()
   ticker?.clear()
   ticker = null
   if (searchTimer) {

@@ -6,7 +6,7 @@
  * 点击展开详情（卡片经 MessageCardHost）；核准/驳回走 useWorkflowAction，
  * 409 冲突时自动刷新剔除脏任务。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import MessageCardHost from '../a2ui/MessageCardHost.vue'
 import type {
@@ -34,11 +34,34 @@ const configError = ref<string | null>(null)
 
 const tasks = ref<TaskSummary[]>([])
 const selectedThreadId = ref<string | null>(null)
+/**
+ * 打开详情时的任务快照。
+ * 审批后该任务会离开待办池（列表里再也查不到），
+ * 但详情仍需展示终态卡片，且快照持有提交审批所需的锁版本。
+ */
+const selectedTask = ref<TaskSummary | null>(null)
 const detailMessages = ref<ChatMessageRecord[]>([])
+
+/**
+ * 选中任务是否仍在待办池中。
+ * 判据必须业务中立：core 层不得知道任何业务卡片类型，
+ * 只能用「是否仍在待审批队列」这一通用事实驱动底部操作条显隐。
+ */
+const stillPending = computed(() =>
+  tasks.value.some((t) => t.thread_id === selectedThreadId.value),
+)
 
 const { isSubmitting, submitAudit, notice } = useWorkflowAction()
 
 let loaded = false
+
+/**
+ * 上次拉取时的工作流事件节拍。
+ *
+ * 用于判定"离开 Tab 期间是否发生过状态变更"：发生过则列表可能陈旧，
+ * 重新进入时必须重拉；没发生过则无需重复请求。
+ */
+let fetchedAtTick = -1
 
 async function fetchTasks(force = false) {
   const tasksUrl = endpoints.value?.tasks
@@ -53,40 +76,63 @@ async function fetchTasks(force = false) {
   const { data } = await http.get<{ items: TaskSummary[] }>(tasksUrl)
   tasks.value = data.items ?? []
   loaded = true
+  fetchedAtTick = workbench.state.workflowEventTick
   void force
 }
 
-/** Tab 激活时调用：首次进入懒加载，重复进入不重复请求。 */
+/** Tab 激活时调用：首次进入懒加载；期间发生过状态变更则重拉。 */
 async function activate() {
-  if (!loaded) await fetchTasks()
+  if (!loaded || fetchedAtTick !== workbench.state.workflowEventTick) {
+    await fetchTasks()
+  }
 }
 
-async function openDetail(task: TaskSummary) {
+/**
+ * 按 thread_id 读取该线程的消息 / 卡片快照。
+ *
+ * 只依赖 thread_id，不依赖任务是否仍在待办池 —— 审批后任务离池，
+ * 但详情仍须能重拉并展示终态卡片（审批结论写在原卡上）。
+ */
+async function loadDetail(threadId: string) {
   const messagesUrl = endpoints.value?.messages
   if (!messagesUrl) {
     configError.value =
       '工作流端点未配置：业务插件未注册或后端清单未同步，请检查插件装载状态。'
     return
   }
-  selectedThreadId.value = task.thread_id
-  const { data } = await http.get<{ items: ChatMessageRecord[] }>(
-    messagesUrl,
-    { params: { thread_id: task.thread_id } },
-  )
-  detailMessages.value = data.items ?? []
+  try {
+    const { data } = await http.get<{ items: ChatMessageRecord[] }>(
+      messagesUrl,
+      { params: { thread_id: threadId } },
+    )
+    detailMessages.value = data.items ?? []
+  } catch {
+    detailMessages.value = []
+  }
 }
 
-async function decide(task: TaskSummary, approved: boolean) {
+async function openDetail(task: TaskSummary) {
+  selectedThreadId.value = task.thread_id
+  selectedTask.value = task
+  await loadDetail(task.thread_id)
+}
+
+async function decide(approved: boolean) {
   const resumeUrl = endpoints.value?.resume
   if (!resumeUrl) {
     configError.value =
       '工作流端点未配置：业务插件未注册或后端清单未同步，请检查插件装载状态。'
     return
   }
+  const threadId = selectedThreadId.value
+  const task = selectedTask.value
+  if (!threadId || !task) {
+    return
+  }
   await submitAudit(
     resumeUrl,
     {
-      thread_id: task.thread_id,
+      thread_id: threadId,
       lock_version: task.lock_version,
       approved,
       opinion: approved ? '核准许可' : '驳回修改',
@@ -96,18 +142,13 @@ async function decide(task: TaskSummary, approved: boolean) {
     async () => {
       await fetchTasks()
       workbench.markConversationsStale()
-      if (selectedThreadId.value === task.thread_id) {
-        selectedThreadId.value = null
-        detailMessages.value = []
-      }
+      // 详情不清空：重拉后展示终态卡片（审批结论就写在原审核卡上）
+      await loadDetail(threadId)
     },
-    // 409 冲突：任务已被处理，刷新剔除
+    // 409 冲突：任务已被处理，刷新剔除并重拉详情（此时已是终态）
     async () => {
       await fetchTasks()
-      detailMessages.value = []
-      if (selectedThreadId.value === task.thread_id) {
-        selectedThreadId.value = null
-      }
+      await loadDetail(threadId)
     },
   )
 }
@@ -123,20 +164,31 @@ function makeActionContext(message: ChatMessageRecord): CardActionContext {
 /**
  * 卡片内直接审批（通过 / 驳回）后刷新待办池。
  *
- * 终态任务必须从待办池剔除，否则用户会看到已处理的单据仍在列表里。
+ * 终态任务必须从待办池剔除，否则用户会看到已处理的单据仍在列表里；
+ * 但详情不清空 —— 重拉后展示终态卡片，让操作者看到审批结果。
  */
 async function onCardDecided() {
   await fetchTasks()
-  selectedThreadId.value = null
-  detailMessages.value = []
+  if (selectedThreadId.value) {
+    await loadDetail(selectedThreadId.value)
+  }
 }
 
-/** 409 冲突：任务已被他人处理，刷新剔除并清空详情 */
+/** 409 冲突：任务已被他人处理，刷新剔除并重拉详情（此时已是终态） */
 async function onCardConflict() {
   await fetchTasks()
-  selectedThreadId.value = null
-  detailMessages.value = []
+  if (selectedThreadId.value) {
+    await loadDetail(selectedThreadId.value)
+  }
 }
+
+// 工作流状态变更事件（跨端推送）→ 待办池实时对齐，无需人工刷新
+watch(
+  () => workbench.state.workflowEventTick,
+  () => {
+    void fetchTasks()
+  },
+)
 
 // 组件仅在切到审批池 Tab 时挂载，挂载即懒加载（首次点击才发请求）
 onMounted(activate)
@@ -207,21 +259,16 @@ defineExpose({ refresh: fetchTasks, activate })
         </div>
       </div>
 
-      <!-- 核准 / 驳回 -->
+      <!-- 核准 / 驳回：仅当选中任务仍在待办池中才可操作 -->
       <div
-        v-if="selectedThreadId"
+        v-if="selectedThreadId && stillPending"
         class="flex items-center gap-2 border-t border-gray-200 p-3"
       >
         <button
           type="button"
           class="rounded-md bg-green-600 px-3 py-1.5 text-sm text-white disabled:opacity-50"
           :disabled="isSubmitting"
-          @click="
-            decide(
-              tasks.find((t) => t.thread_id === selectedThreadId)!,
-              true,
-            )
-          "
+          @click="decide(true)"
         >
           核准
         </button>
@@ -229,12 +276,7 @@ defineExpose({ refresh: fetchTasks, activate })
           type="button"
           class="rounded-md bg-gray-200 px-3 py-1.5 text-sm text-gray-700 disabled:opacity-50"
           :disabled="isSubmitting"
-          @click="
-            decide(
-              tasks.find((t) => t.thread_id === selectedThreadId)!,
-              false,
-            )
-          "
+          @click="decide(false)"
         >
           驳回
         </button>

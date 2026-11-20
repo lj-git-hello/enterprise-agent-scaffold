@@ -32,6 +32,12 @@ const permitInfo = computed<PermitInfo | null>(
 
 const status = computed(() => String(payload.value.status ?? ''))
 
+/** 是否为定级后自动签发（无人工核签环节） */
+const autoIssued = computed(() => payload.value.auto_issued === true)
+
+/** 签发说明（自动签发时给出定级理由；人工核签时为核签意见） */
+const opinion = computed(() => String(payload.value.opinion ?? ''))
+
 const permitNo = computed(() => permitInfo.value?.permit_no ?? '')
 
 const issuedAt = computed(() => permitInfo.value?.issued_at ?? '')
@@ -58,14 +64,25 @@ const qrValue = computed(() => {
   <div class="flex flex-col gap-3">
     <div class="flex items-center justify-between">
       <p class="text-sm font-medium text-gray-800">调度许可凭证</p>
-      <span
-        class="rounded-full px-2 py-0.5 text-[10px]"
-        :class="
-          status === 'PERMITTED'
-            ? 'bg-green-100 text-green-700'
-            : 'bg-gray-100 text-gray-600'
-        ">{{ status }}</span>
+      <div class="flex items-center gap-1.5">
+        <span
+          v-if="autoIssued"
+          class="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] text-blue-700"
+        >自动签发</span>
+        <span
+          class="rounded-full px-2 py-0.5 text-[10px]"
+          :class="
+            status === 'PERMITTED'
+              ? 'bg-green-100 text-green-700'
+              : 'bg-gray-100 text-gray-600'
+          ">{{ status }}</span>
+      </div>
     </div>
+
+    <p
+      v-if="opinion"
+      class="rounded-md bg-gray-50 px-2 py-1.5 text-[11px] leading-relaxed text-gray-600"
+    >{{ opinion }}</p>
 
     <template v-if="permitInfo">
       <dl class="flex flex-col gap-1 text-xs text-gray-600">

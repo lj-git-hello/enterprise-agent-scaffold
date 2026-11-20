@@ -18,6 +18,10 @@ export interface ChatMessageRecord {
   created_at: string | null
   /** 全局单调序号（服务端权威排序依据；本地新建消息可缺省） */
   seq?: number
+  /** 卡片视图投影版本：卡片被原地改写时递增，是卡片级乐观锁的依据 */
+  card_version?: number
+  /** 最近一次改写时间（服务端 ISO 串；未改写时等于写入时间） */
+  updated_at?: string | null
 }
 
 /** 卡片交互上下文：卡片动作回调可据此触发重试/上报 */

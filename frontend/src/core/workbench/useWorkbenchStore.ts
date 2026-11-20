@@ -18,6 +18,7 @@ import type {
   TaskSummary,
 } from '../a2ui/types'
 import { fetchSessionMessages, fetchThreads } from '../api/threads'
+import type { WorkflowEventPayload } from '../api/workflow'
 import {
   debounceSaveConversations,
   debounceSaveMessages,
@@ -76,6 +77,12 @@ interface WorkbenchState {
    * apply 后列表还会临时多出一条，用列表长度当 offset 会错位翻页。
    */
   conversationFetched: number
+  /**
+   * 工作流事件节拍：每收到一条状态变更事件即递增。
+   *
+   * 视图据此 watch 并自行决定是否重拉（core 不替视图决定刷新范围）。
+   */
+  workflowEventTick: number
 }
 
 const state = reactive<WorkbenchState>({
@@ -92,6 +99,7 @@ const state = reactive<WorkbenchState>({
   conversationTotal: 0,
   conversationQuery: '',
   conversationFetched: 0,
+  workflowEventTick: 0,
 })
 
 /** 会话集合归属用户（切换身份时随之切换并重新拉取）。 */
@@ -370,6 +378,37 @@ function markConversationsStale(): void {
   state.conversationsStale += 1
 }
 
+/**
+ * 处理服务端广播的工作流状态变更事件（跨端同步入口）。
+ *
+ * 事件语义对 core 是不透明的，core 只做两件事：
+ * 1. 把"有变更发生"这一事实广播出去（workflowEventTick 递增），
+ *    由各视图自行决定是否需要重拉；
+ * 2. 若变更命中的线程属于当前会话，则重拉中栏消息（终态即时呈现）。
+ *
+ * @param payload 事件负载（业务中立）
+ * @param selfId 本端操作者标识：自己触发的变更本端已即时更新，跳过
+ */
+async function handleWorkflowEvent(
+  payload: WorkflowEventPayload,
+  selfId: string,
+): Promise<void> {
+  if (payload.actor_id && payload.actor_id === selfId) {
+    // 自己触发的变更：本端已即时更新，跳过以免重复拉取
+    return
+  }
+  state.workflowEventTick += 1
+  // 左栏状态 / 锁版本一律以服务端为准：任何状态变更都要对齐一次
+  markConversationsStale()
+  // 命中当前会话 → 重拉中栏（终态卡片即时呈现）
+  const hit = state.conversationList.find(
+    (item) => item.thread_id === payload.thread_id,
+  )
+  if (hit && hit.session_id === state.activeSessionId) {
+    await refreshMessages()
+  }
+}
+
 /** 把后端 apply 返回结果收口为：中栏消息 + 会话集合 upsert + 折叠右栏。 */
 function applyResult(result: ApplyResult) {
   const card = result.card ?? {}
@@ -486,6 +525,7 @@ export function useWorkbenchStore() {
     refreshMessages,
     beginLiveTurn,
     markConversationsStale,
+    handleWorkflowEvent,
     applyResult,
     setConversations,
     setRightDrawer,
