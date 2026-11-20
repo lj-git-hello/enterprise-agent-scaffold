@@ -25,6 +25,12 @@ export interface PluginIdentity {
   role: string
 }
 
+/** 右栏表单分区标题的默认文案（插件未声明时的中性回落） */
+export const DEFAULT_FORM_SECTION_TITLE = '业务表单'
+
+/** 左栏关联计数单位文案的默认文案（插件未声明时的中性回落） */
+export const DEFAULT_SESSION_COUNT_LABEL = '关联'
+
 /**
  * 卡片载荷脱敏器：剔除不应落入本地存储的敏感字段。
  *
@@ -46,6 +52,14 @@ export interface PluginDefinition {
   /** 业务卡片：card_type → 组件（注册进通用卡片中枢） */
   cards?: Record<string, Component>
   /**
+   * 只读检视面板：card_type → 组件。
+   *
+   * 与 cards 同构的另一套映射，但语义不同：cards 是"可交互卡片"，
+   * inspectors 是"只读详情视图"（无审批 / 提交动作，仅呈现服务端权威数据）。
+   * core 只负责按 card_type 解析并渲染，不理解面板内的业务字段。
+   */
+  inspectors?: Record<string, Component>
+  /**
    * 卡片脱敏器：card_type → 脱敏函数。
    *
    * 仅作用于本地快照（离线兜底），实时视图与服务端权威数据保持原样。
@@ -53,6 +67,10 @@ export interface PluginDefinition {
   cardSanitizers?: Record<string, CardPayloadSanitizer>
   /** 业务表单组件（宿主经动态组件渲染） */
   formComponent?: Component
+  /** 右栏表单区标题（core 不写死任何业务分区名，未声明时回落中性默认名） */
+  formSectionTitle?: string
+  /** 左栏关联计数的单位文案（未声明时回落中性默认名） */
+  sessionCountLabel?: string
   /** 演示身份（可缺省：生产环境接入企业 IAM 时无需） */
   identities?: PluginIdentity[]
 }
@@ -130,6 +148,31 @@ class PluginRegistryClass {
     if (!plugin) return undefined
     return plugin.cardSanitizers?.[cardType]
   }
+
+  /**
+   * 取生效插件为某卡片类型注册的只读检视面板；未注册返回 undefined。
+   *
+   * cardType 为空（无卡片类型）时同样返回 undefined —— 没有类型就没有
+   * 可检视的业务对象，core 不得凭空造一个视图。
+   */
+  getInspector(cardType: string | null): Component | undefined {
+    if (!cardType) return undefined
+    const plugin = this.getActive()
+    if (!plugin) return undefined
+    return plugin.inspectors?.[cardType]
+  }
+
+  /** 右栏表单分区标题（响应式；插件未声明时回落中性默认名）。 */
+  readonly activeFormSectionTitle = computed<string>(() => {
+    const plugin = this.getActive()
+    return plugin?.formSectionTitle ?? DEFAULT_FORM_SECTION_TITLE
+  })
+
+  /** 左栏关联计数的单位文案（响应式；插件未声明时回落中性默认名）。 */
+  readonly activeSessionCountLabel = computed<string>(() => {
+    const plugin = this.getActive()
+    return plugin?.sessionCountLabel ?? DEFAULT_SESSION_COUNT_LABEL
+  })
 
   /**
    * 生效插件的端点（响应式）。

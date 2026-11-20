@@ -13,6 +13,7 @@ import CitationsCard from './cards/CitationsCard.vue'
 import PermitResultCard from './cards/PermitResultCard.vue'
 import SafetyDiffCard from './cards/SafetyDiffCard.vue'
 import SubstationApplyForm from './forms/SubstationApplyForm.vue'
+import WorkOrderInspectPanel from './panels/WorkOrderInspectPanel.vue'
 
 /** 插件唯一名（须与后端 app/plugins/power_grid/plugin.py 的 name 一致） */
 export const POWER_PLUGIN_NAME = 'power_grid'
@@ -81,6 +82,20 @@ export const plugin: PluginDefinition = {
   cardSanitizers: {
     permit_result: sanitizePermitResult,
   },
+  /**
+   * 只读检视面板：card_type → 组件。
+   *
+   * 审核卡与许可卡共用同一面板：面板按线程一次取全两类卡片，
+   * 便于在同一视图里对照「核签结论」与「许可凭证」。
+   */
+  inspectors: {
+    dispatcher_audit: WorkOrderInspectPanel,
+    permit_result: WorkOrderInspectPanel,
+  },
+  /** 右栏表单分区标题（core 不写死业务分区名） */
+  formSectionTitle: '工单快速提交入口',
+  /** 左栏关联计数的单位文案 */
+  sessionCountLabel: '工单',
 }
 
 export { SubstationApplyForm }

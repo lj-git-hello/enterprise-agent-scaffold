@@ -22,7 +22,7 @@ import {
 
 import TaskApprovalPool from './TaskApprovalPool.vue'
 import TaskHistoryList from './TaskHistoryList.vue'
-import type { TaskSummary } from '../a2ui/types'
+import type { ChatMessageRecord, SessionSummary } from '../a2ui/types'
 import { chatStream, type StreamStatus } from '../api/agent'
 import { clearToken, http, setToken } from '../api/http'
 import { subscribeWorkflowEvents } from '../api/workflow'
@@ -34,6 +34,7 @@ import {
   storageHealth,
 } from '../engine/storage'
 import { PluginRegistry, type PluginIdentity } from '../plugins/registry'
+import { formatDateTime } from '../utils/datetime'
 import {
   type ApplyResult,
   useWorkbenchStore,
@@ -66,19 +67,40 @@ const currentIdentity = computed<PluginIdentity>(
 /** 是否已退出登录（退出后不再自动建立会话） */
 const loggedOut = ref(false)
 
+/**
+ * 身份激活代次：并发切换时只认最后一次激活的结果。
+ *
+ * 快速连切身份时，先发后到的旧响应不得写入过期令牌，也不得继续收尾。
+ */
+let activationEpoch = 0
+
 // 调后端登录端点换取真实 JWT（后端只认合规 JWT，不能写 simulated:*）
-async function loginAs(userId: string) {
+async function loginAs(userId: string, epoch: number) {
   if (!userId) {
     return
   }
   const { data } = await http.post<{ access_token: string }>('/v1/auth/login', {
     user_id: userId,
   })
+  // 已被更新的切换取代：过期令牌绝不能写回
+  if (epoch !== activationEpoch) {
+    return
+  }
   setToken(data.access_token)
 }
 
 /** 已激活身份（避免重复登录；登录失败后清空以允许重试） */
 let activatedId = ''
+
+/**
+ * 当前生效身份：凭据真正对应的用户。
+ *
+ * 与下拉框选中值可能短暂不一致（切换失败、或切换进行中）：
+ * 取数一律以生效身份为准，避免用旧凭据取到别的身份的数据。
+ */
+function effectiveIdentityId(): string {
+  return workbenchState.activeOwnerId || currentIdentity.value.id
+}
 
 // ---- 工作流事件订阅（跨端状态变更实时同步） ----
 // 订阅通道的身份与受众由 JWT 判定，切换身份必须重建订阅，
@@ -90,14 +112,16 @@ function stopWorkflowSubscription(): void {
   workflowAbort = null
 }
 
-function startWorkflowSubscription(): void {
+function startWorkflowSubscription(userId: string): void {
   stopWorkflowSubscription()
   const controller = new AbortController()
   workflowAbort = controller
   void subscribeWorkflowEvents(
     {
       onStatusChanged: (payload) => {
-        void workbench.handleWorkflowEvent(payload, currentIdentity.value.id)
+        // 事件按"创建该订阅的身份"归因，不在回调时反查当前身份：
+        // 旧订阅的迟到事件因此不会记到新身份名下。
+        void workbench.handleWorkflowEvent(payload, userId)
       },
     },
     controller.signal,
@@ -108,39 +132,98 @@ function startWorkflowSubscription(): void {
   })
 }
 
+/** 身份切换失败提示（界面给出重试入口，不静默失败）。 */
+const identityError = ref<string | null>(null)
+
+/**
+ * 身份切换导致的中止标记。
+ *
+ * 切换身份会主动中断在途对话流 —— 属预期行为，不得当作"连接失败"提示用户。
+ */
+let identitySwitchAbort = false
+
 async function activateIdentity(userId: string): Promise<void> {
   if (!userId || userId === activatedId) {
     return
   }
   const previousId = activatedId
   activatedId = userId
+  const epoch = ++activationEpoch
+  identityError.value = null
   try {
-    // 切换身份：清理前一身份在本机的缓存分区（共享终端安全）
+    // 切换身份：在途对话流属于上一身份，先中止，
+    // 否则其 token / 卡片会被写进新身份的中栏。
     if (previousId && previousId !== userId) {
-      await clearUserPartition(previousId)
+      // 仅在确有在途流时置中断标记：否则会误吞下一轮流的错误提示
+      if (abortController) {
+        identitySwitchAbort = true
+        abortController.abort()
+      }
+      ticker?.clear()
+      isStreaming.value = false
+      // 先重置内存态并解除落盘归属，再清分区：
+      // 顺序颠倒会让排队中的防抖落盘在清理完成后把分区重新写回来。
+      workbench.resetAll()
+      // 清理前一身份在本机的缓存分区（共享终端安全）。
+      // 本地缓存清理失败不得阻断身份切换，故单独兜住异常。
+      try {
+        await clearUserPartition(previousId)
+      } catch (error) {
+        console.error('清理本地缓存分区失败：', error)
+      }
       // 换人：搜索条件一并清空（store 侧亦会重置查询与分页位点）
       searchInput.value = ''
       if (searchTimer) {
         clearTimeout(searchTimer)
         searchTimer = null
       }
+      // 期间又发生了新的切换：本次激活作废
+      if (epoch !== activationEpoch) return
     }
-    await loginAs(userId)
-    // 同步身份供深层卡片做权限判定
-    setCurrentUser(userId, currentIdentity.value.role)
+    await loginAs(userId, epoch)
+    // 已被更新的切换取代：放弃本次收尾（令牌亦未写入）
+    if (epoch !== activationEpoch) return
+    // 同步身份供深层卡片做权限判定（角色取自目标身份本身）
+    const target = identities.value.find((item) => item.id === userId)
+    setCurrentUser(userId, target?.role ?? currentIdentity.value.role)
     // 订阅工作流事件（JWT 已更新，受众随身份生效）
-    startWorkflowSubscription()
-    // 登出后重新登录：会话 ID 已被清空，必须重建一个，
+    startWorkflowSubscription(userId)
+    // 登出后重新登录 / 切换身份后：会话 ID 已被清空，必须重建一个，
     // 否则新一轮对话会以空 thread_id 提交到服务端。
     if (!workbenchState.activeSessionId) {
       workbench.setSession(newSessionId())
     }
     // 切换身份后从服务端加载该用户的会话集合（审批人本地通常为空）
     await workbench.refreshConversations(userId)
+    if (epoch !== activationEpoch) return
+    // 切换身份后自动打开新身份的首个会话：
+    // 中栏必须只呈现新身份自己的内容，绝不残留上一身份的对话。
+    if (previousId && previousId !== userId) {
+      const first = workbenchState.conversationList[0]
+      if (first) {
+        await workbench.openConversation(first)
+      }
+    }
   } catch (error) {
-    activatedId = ''
     console.error('身份激活失败：', error)
+    // 已被更新的切换取代：本次失败作废，不影响更新的那次
+    if (epoch !== activationEpoch) return
+    activatedId = ''
+    identityError.value = previousId
+      ? '身份切换失败：无法获取新的登录凭据，已返回上一身份。'
+      : '身份激活失败：无法获取登录凭据，请重试。'
+    // 回滚：下拉框回到上一身份，由既有 watch(identityId) 触发重新激活。
+    // （activatedId 已清空，不会双激活，也不会无限递归）
+    if (previousId) {
+      identityId.value = previousId
+    }
   }
+}
+
+/** 重试身份激活（首次激活失败时无可回滚目标，必须提供显式重试入口）。 */
+function retryIdentity(): void {
+  identityError.value = null
+  void activateIdentity(identityId.value)
 }
 
 async function switchIdentity(event: Event) {
@@ -223,10 +306,43 @@ function createNewSession() {
 }
 
 /** 点击会话项：切换到该会话并恢复其中栏消息（服务端优先）。 */
-async function selectConversation(summary: TaskSummary) {
+async function selectConversation(summary: SessionSummary) {
   await workbench.openConversation(summary)
   activeTab.value = 'history'
 }
+
+/**
+ * 中栏卡片点击 → 打开右栏只读检视面板。
+ *
+ * 检视态是唯一的高亮来源：面板与中栏边框都由 store 的检视态派生，
+ * 不存在第二份需要同步的"高亮状态"。
+ */
+function handleInspect(message: ChatMessageRecord): void {
+  workbench.openInspection(message.thread_id, message.card_type)
+  // 检视面板在右栏：右栏处于折叠态时自动展开，否则用户看不到任何反馈
+  workbench.setRightDrawer(true)
+}
+
+/** 是否处于只读检视态。 */
+const inspectionOpen = computed(() =>
+  Boolean(workbenchState.inspectedThreadId),
+)
+
+/**
+ * 当前检视对象的只读面板组件（插件注册，core 不解释其内部字段）。
+ *
+ * 未注册对应卡片类型的检视视图时为空 —— 右栏如实提示"未注册"，
+ * 绝不渲染空白面板假装成功。
+ */
+const inspectorComponent = computed(() =>
+  PluginRegistry.getInspector(workbenchState.inspectedCardType),
+)
+
+/** 右栏表单分区标题（插件提供；未声明时回落中性默认名）。 */
+const formSectionTitle = computed(() => PluginRegistry.activeFormSectionTitle.value)
+
+/** 左栏关联计数的单位文案（插件提供；未声明时回落中性默认名）。 */
+const sessionCountLabel = computed(() => PluginRegistry.activeSessionCountLabel.value)
 
 /** 表单提交成功后的统一收口（供 App 经组件 ref 调用）。 */
 async function handleApplied(result: ApplyResult) {
@@ -237,7 +353,7 @@ async function handleApplied(result: ApplyResult) {
 
 /** 手动刷新左栏（服务端权威列表）。 */
 async function refreshList() {
-  await workbench.refreshConversations(currentIdentity.value.id)
+  await workbench.refreshConversations(effectiveIdentityId())
 }
 
 // ---- 左栏会话列表：标题搜索 + 分页折叠 ----
@@ -287,7 +403,7 @@ const remainingCount = computed(() =>
 watch(
   () => workbenchState.conversationsStale,
   () => {
-    void workbench.refreshConversations(currentIdentity.value.id)
+    void workbench.refreshConversations(effectiveIdentityId())
   },
 )
 
@@ -336,7 +452,7 @@ const messageOfflineHint = computed(() =>
  * 否则用户会一直看着陈旧数据而不自知。
  */
 async function handleOnline() {
-  await workbench.refreshConversations(currentIdentity.value.id)
+  await workbench.refreshConversations(effectiveIdentityId())
   await workbench.refreshMessages()
 }
 
@@ -445,11 +561,18 @@ async function sendDraft() {
       abortController.signal,
     )
   } catch (error) {
+    // 身份切换主动中断：属预期行为，不作为故障提示
+    if (identitySwitchAbort) {
+      identitySwitchAbort = false
+      return
+    }
     streamError.value =
       (error as { message?: string }).message ?? '对话连接失败，请稍后重试。'
   } finally {
     isStreaming.value = false
     abortController = null
+    // 本轮结束：中断标记复位（异常路径已在 catch 中先行消费）
+    identitySwitchAbort = false
     // 与服务端对齐权威副本（并恢复本地快照写入）
     void workbench.refreshMessages()
     // 本轮新建了聊天线程 → 左栏与服务端对齐一次（标题 / 状态以服务端为准）
@@ -475,8 +598,9 @@ defineExpose({ handleApplied })
 
 // 挂载时探测本地缓存可用性
 onMounted(async () => {
-  // 启动时为当前身份确保一个有效 JWT（旧 simulated:* / 空值会被覆盖）
-  await activateIdentity(currentIdentity.value.id)
+  // 启动时为当前身份确保一个有效 JWT（旧 simulated:* / 空值会被覆盖）。
+  // 用下拉框的选中身份：此刻身份清单可能尚未到达，为空则跳过（清单到达后由 watch 触发）。
+  await activateIdentity(identityId.value)
   await probeHealth()
 })
 </script>
@@ -523,6 +647,12 @@ onMounted(async () => {
     <!-- 已退出登录提示 -->
     <div v-if="loggedOut" class="border-b bg-amber-50 px-4 py-2 text-xs text-amber-700">
       已退出登录：JWT 与本机缓存分区均已清除，服务端数据不受影响。
+    </div>
+
+    <!-- 身份切换失败提示：明确反馈并给出重试入口，不静默失败 -->
+    <div v-if="identityError" class="flex items-center gap-2 border-b bg-red-50 px-4 py-2 text-xs text-red-700">
+      <span>{{ identityError }}</span>
+      <button type="button" class="underline" @click="retryIdentity">重试</button>
     </div>
 
     <!-- 主体三栏 -->
@@ -582,7 +712,7 @@ onMounted(async () => {
               <template v-else>暂无会话，可在右侧填报发起</template>
             </p>
 
-            <button v-for="item in workbenchState.conversationList" :key="item.thread_id" type="button"
+            <button v-for="item in workbenchState.conversationList" :key="item.session_id" type="button"
               class="mb-2 w-full rounded-md border p-2 text-left transition hover:bg-white" :class="sessionId === item.session_id
                 ? 'border-blue-500 bg-blue-50'
                 : 'border-gray-200 bg-white'
@@ -590,15 +720,19 @@ onMounted(async () => {
               <div class="flex items-center gap-1.5">
                 <ClipboardList class="h-3.5 w-3.5 shrink-0 text-gray-400" />
                 <span class="truncate text-xs font-medium text-gray-800">
-                  {{ item.title ?? item.thread_id }}
+                  {{ item.title || item.session_id }}
                 </span>
               </div>
               <div class="mt-1 flex items-center gap-1.5">
                 <span class="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] text-amber-700">
                   {{ item.status }}
                 </span>
-                <span class="text-[10px] text-gray-500">
-                  Lock: v{{ item.lock_version }}
+                <span v-if="item.related_count > 0"
+                  class="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] text-blue-700">
+                  {{ sessionCountLabel }} {{ item.related_count }} 条
+                </span>
+                <span class="ml-auto text-[10px] text-gray-400">
+                  {{ formatDateTime(item.last_activity_at) }}
                 </span>
               </div>
             </button>
@@ -645,7 +779,8 @@ onMounted(async () => {
 
         <div class="flex-1 overflow-hidden">
           <TaskHistoryList v-if="activeTab === 'history'" :session-id="sessionId" :current-user-id="currentIdentity.id"
-            :messages="workbenchState.activeMessages" />
+            :messages="workbenchState.activeMessages" :inspected-thread-id="workbenchState.inspectedThreadId"
+            :inspected-card-type="workbenchState.inspectedCardType" @inspect="handleInspect" />
           <TaskApprovalPool v-else :current-user-id="currentIdentity.id" :current-role="currentIdentity.role" />
         </div>
 
@@ -676,17 +811,37 @@ onMounted(async () => {
       <!-- 折叠态保留 w-10 把手轨道：absolute 按钮需相对本 aside 定位，
            若容器宽度归零则把手仍会溢出视口外，导致右栏无法重新展开。 -->
       <aside class="relative flex flex-col border-l bg-gray-50/50 transition-all duration-300"
-        :class="rightOpen ? 'w-80' : 'w-10'">
+        :class="rightOpen ? (inspectionOpen ? 'w-96' : 'w-80') : 'w-10'">
         <!-- v-show 而非 v-if：折叠时不销毁业务表单，已填数据得以保留 -->
         <div v-show="rightOpen" class="flex h-full flex-col">
           <div class="flex items-center justify-between p-3">
-            <span class="text-xs font-medium">业务表单</span>
+            <span class="text-xs font-medium">工作台侧栏</span>
             <button type="button" class="text-xs text-gray-500" @click="workbench.setRightDrawer(false)">
               收起
             </button>
           </div>
 
+          <!-- 区1：只读详情检视（与下方表单区之间以分割线明确分区） -->
+          <div v-if="inspectionOpen" class="border-b border-gray-200 px-3 pb-3">
+            <div class="mb-2 flex items-center justify-between">
+              <span class="text-xs font-medium">详情检视</span>
+              <button type="button" class="text-[11px] text-gray-500 hover:text-gray-700"
+                @click="workbench.closeInspection()">
+                关闭
+              </button>
+            </div>
+            <component :is="inspectorComponent" v-if="inspectorComponent"
+              :thread-id="workbenchState.inspectedThreadId" />
+            <p v-else class="text-[11px] text-gray-400">
+              该卡片类型未注册只读检视视图
+            </p>
+          </div>
+
+          <!-- 区2：业务表单（v-show 保活，草稿不因折叠 / 检视而丢失） -->
           <div class="flex-1 overflow-y-auto p-3">
+            <p class="mb-2 text-xs font-medium">
+              {{ formSectionTitle }}
+            </p>
             <slot name="business-form" :session-id="sessionId">
               <p class="text-xs text-gray-400">
                 业务插件表单位（后续挂载）

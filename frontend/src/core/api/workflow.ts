@@ -47,6 +47,8 @@ export interface WorkflowEventPayload {
   occurred_at: string
   /** 受众标识集合（user_id 或 role） */
   audience: string[]
+  /** 线程归属的会话标识（会话级列表据此定位会话；未知时为空串） */
+  session_id: string
 }
 
 /** 事件回调集合 */

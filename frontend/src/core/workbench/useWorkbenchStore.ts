@@ -15,9 +15,10 @@ import { reactive, watch } from 'vue'
 
 import type {
   ChatMessageRecord,
+  SessionSummary,
   TaskSummary,
 } from '../a2ui/types'
-import { fetchSessionMessages, fetchThreads } from '../api/threads'
+import { fetchSessionMessages, fetchSessions } from '../api/threads'
 import type { WorkflowEventPayload } from '../api/workflow'
 import {
   debounceSaveConversations,
@@ -52,7 +53,10 @@ export interface ApplyResult {
 interface WorkbenchState {
   activeSessionId: string
   activeMessages: ChatMessageRecord[]
-  conversationList: TaskSummary[]
+  /**
+   * 左栏会话集合（会话级聚合视图：一次会话框内的多次对话 / 多个工单只占一行）。
+   */
+  conversationList: SessionSummary[]
   rightDrawerOpen: boolean
   /** 左栏数据来源 */
   conversationSource: DataSource
@@ -83,6 +87,21 @@ interface WorkbenchState {
    * 视图据此 watch 并自行决定是否重拉（core 不替视图决定刷新范围）。
    */
   workflowEventTick: number
+  /**
+   * 已生效身份：当前凭据真正对应的用户。
+   *
+   * 与"下拉框选中值"不同 —— 选中只是切换意图，凭据才是事实。
+   * 本值只在凭据换好之后才变化，视图据此判断"界面身份 == 生效身份"。
+   */
+  activeOwnerId: string
+  /**
+   * 正在被只读检视的线程标识（无则为空串）。
+   *
+   * 高亮与检视面板都由它派生：不存在第二份"高亮状态"，杜绝两者失配。
+   */
+  inspectedThreadId: string
+  /** 正在被检视的卡片类型（无则为空串） */
+  inspectedCardType: string
 }
 
 const state = reactive<WorkbenchState>({
@@ -100,10 +119,20 @@ const state = reactive<WorkbenchState>({
   conversationQuery: '',
   conversationFetched: 0,
   workflowEventTick: 0,
+  activeOwnerId: '',
+  inspectedThreadId: '',
+  inspectedCardType: '',
 })
 
 /** 会话集合归属用户（切换身份时随之切换并重新拉取）。 */
 let conversationOwnerId: string | null = null
+
+/**
+ * 会话打开代次：并发打开会话时作废被抢占的旧请求。
+ *
+ * 用户连点两个会话时，先发后到的旧响应不得覆盖新会话的中栏内容。
+ */
+let openSessionSeq = 0
 
 /** 当前 activeMessages 归属的会话 ID（与消息内容严格对应）。 */
 let messagesSessionId = ''
@@ -161,6 +190,16 @@ function buildSnapshot(messages: ChatMessageRecord[]): ChatMessageRecord[] {
   return messages.map(sanitizeMessage)
 }
 
+/**
+ * 归属校验：发起请求时记下的归属是否仍是当前归属。
+ *
+ * 所有跨异步边界的拉取统一用它复核：归属已变（切换身份 / 登出）则丢弃响应，
+ * 旧身份的数据绝不允许落到新身份的中栏、左栏或本地分区。
+ */
+function isOwnerCurrent(ownerId: string | null): boolean {
+  return ownerId !== null && ownerId === conversationOwnerId
+}
+
 /** 切换当前会话：替换会话 ID 与消息列表。 */
 function setSession(sessionId: string, messages: ChatMessageRecord[] = []) {
   messagesSessionId = sessionId
@@ -186,20 +225,8 @@ function appendMessageText(id: string, chunk: string) {
 }
 
 /** 整体替换左栏列表（服务端回读 / 缓存兜底）。 */
-function setConversations(list: TaskSummary[]) {
+function setConversations(list: SessionSummary[]) {
   state.conversationList.splice(0, state.conversationList.length, ...list)
-}
-
-/** 左栏 upsert（按 thread_id 去重覆盖）。 */
-function upsertConversation(summary: TaskSummary) {
-  const existingIndex = state.conversationList.findIndex(
-    (item) => item.thread_id === summary.thread_id,
-  )
-  if (existingIndex >= 0) {
-    state.conversationList.splice(existingIndex, 1, summary)
-  } else {
-    state.conversationList.unshift(summary)
-  }
 }
 
 /**
@@ -213,6 +240,12 @@ function upsertConversation(summary: TaskSummary) {
  * 不应把第 2 页折叠掉。
  */
 async function refreshConversations(userId: string): Promise<void> {
+  // 归属已绑定给别的身份时不得改绑：
+  // 切换失败等场景下"下拉框值"与"生效身份"可能短暂不一致，
+  // 改绑会让旧凭据取到的数据挂到新身份名下。
+  if (conversationOwnerId !== null && conversationOwnerId !== userId) {
+    return
+  }
   // 身份变更检测必须先于赋值：conversationOwnerId 记录的是归属身份
   const ownerChanged = conversationOwnerId !== userId
   if (ownerChanged) {
@@ -223,13 +256,16 @@ async function refreshConversations(userId: string): Promise<void> {
     state.conversationTotal = 0
   }
   conversationOwnerId = userId
+  // 凭据已生效，此后才允许视图按"生效身份"重新取数
+  state.activeOwnerId = userId
   try {
-    const resp = await fetchThreads({
-      kind: 'all',
+    const resp = await fetchSessions({
       limit: Math.max(CONVERSATION_PAGE_SIZE, state.conversationFetched),
       offset: 0,
       q: state.conversationQuery || undefined,
     })
+    // 请求期间归属已变（切换身份）→ 丢弃旧身份的响应
+    if (!isOwnerCurrent(userId)) return
     setConversations(resp.items)
     state.conversationFetched = resp.items.length
     state.conversationHasMore = resp.has_more
@@ -238,7 +274,7 @@ async function refreshConversations(userId: string): Promise<void> {
     state.lastSyncedAt = Date.now()
     state.syncError = null
   } catch (error) {
-    const cached = await loadConversations<TaskSummary>(userId)
+    const cached = await loadConversations<SessionSummary>(userId)
     if (cached) {
       setConversations(cached.data)
       state.conversationSource = 'cache'
@@ -257,24 +293,26 @@ async function refreshConversations(userId: string): Promise<void> {
 /**
  * 追加下一页会话条目（"显示更多"）。
  *
- * 追加时按 thread_id 去重：列表按"最近活跃"排序，条目会随新消息上浮，
+ * 追加时按 session_id 去重：列表按"最近活跃"排序，条目会随新消息上浮，
  * offset 分页因此天然可能与已加载区间重叠。
  */
 async function loadMoreConversations(): Promise<void> {
-  if (!conversationOwnerId || !state.conversationHasMore) return
+  const ownerId = conversationOwnerId
+  if (!ownerId || !state.conversationHasMore) return
   // 离线快照无法翻页
   if (state.conversationSource !== 'server') return
   try {
-    const resp = await fetchThreads({
-      kind: 'all',
+    const resp = await fetchSessions({
       limit: CONVERSATION_PAGE_SIZE,
       offset: state.conversationFetched,
       q: state.conversationQuery || undefined,
     })
+    // 请求期间归属已变（切换身份）→ 丢弃旧身份的响应
+    if (!isOwnerCurrent(ownerId)) return
     const known = new Set(
-      state.conversationList.map((item) => item.thread_id),
+      state.conversationList.map((item) => item.session_id),
     )
-    const fresh = resp.items.filter((item) => !known.has(item.thread_id))
+    const fresh = resp.items.filter((item) => !known.has(item.session_id))
     state.conversationList.push(...fresh)
     state.conversationFetched += resp.items.length
     state.conversationHasMore = resp.has_more
@@ -305,13 +343,21 @@ async function searchConversations(query: string): Promise<void> {
 /**
  * 打开某条会话：服务端拉取消息，失败降级到本地快照。
  */
-async function openConversation(summary: TaskSummary): Promise<void> {
+async function openConversation(summary: SessionSummary): Promise<void> {
+  const ownerId = conversationOwnerId
+  const seq = ++openSessionSeq
+  if (!ownerId) return
+  // 切换会话即关闭检视：被检视的卡片属于上一个会话，留着只会看到错位的详情
+  closeInspection()
   try {
     const resp = await fetchSessionMessages(summary.session_id, { limit: 300 })
+    // 归属已变（切换身份）或已被更新的打开请求抢占 → 丢弃响应
+    if (!isOwnerCurrent(ownerId) || seq !== openSessionSeq) return
     setSession(summary.session_id, resp.items)
     state.messageSource = 'server'
     state.syncError = null
   } catch (error) {
+    if (!isOwnerCurrent(ownerId) || seq !== openSessionSeq) return
     // 404 = 服务端权威判定该会话暂无可见线程（空态），不是故障
     if (isEmptySession(error)) {
       setSession(summary.session_id, [])
@@ -319,10 +365,9 @@ async function openConversation(summary: TaskSummary): Promise<void> {
       state.syncError = null
       return
     }
-    const cached = await loadMessages<ChatMessageRecord>(
-      conversationOwnerId ?? '',
-      summary.session_id,
-    )
+    // 兜底快照必须按"发起时"的归属读取：回调时的归属可能已换成别人
+    const cached = await loadMessages<ChatMessageRecord>(ownerId, summary.session_id)
+    if (!isOwnerCurrent(ownerId) || seq !== openSessionSeq) return
     setSession(summary.session_id, cached?.data ?? [])
     state.messageSource = cached ? 'cache' : 'none'
     state.syncError = describeError(error)
@@ -337,9 +382,13 @@ async function openConversation(summary: TaskSummary): Promise<void> {
  */
 async function refreshMessages(): Promise<void> {
   const sessionId = state.activeSessionId
-  if (!sessionId || !conversationOwnerId) return
+  const ownerId = conversationOwnerId
+  if (!sessionId || !ownerId) return
   try {
     const resp = await fetchSessionMessages(sessionId, { limit: 300 })
+    // 会话或归属在请求期间已变（切换身份）→ 丢弃：
+    // 否则旧身份的消息会在切换完成后回填进新身份的中栏
+    if (sessionId !== state.activeSessionId || !isOwnerCurrent(ownerId)) return
     setSession(sessionId, resp.items)
     state.messageSource = 'server'
     state.syncError = null
@@ -347,6 +396,8 @@ async function refreshMessages(): Promise<void> {
     persistMessagesSnapshot()
   } catch (error) {
     suppressMessageWrite = false
+    // 同上：迟到的响应不得改写当前会话号（404 分支会把旧会话号写回）
+    if (sessionId !== state.activeSessionId || !isOwnerCurrent(ownerId)) return
     // 404 = 服务端权威判定该会话暂无可见线程（空态），不是故障
     if (isEmptySession(error)) {
       setSession(sessionId, [])
@@ -401,10 +452,9 @@ async function handleWorkflowEvent(
   // 左栏状态 / 锁版本一律以服务端为准：任何状态变更都要对齐一次
   markConversationsStale()
   // 命中当前会话 → 重拉中栏（终态卡片即时呈现）
-  const hit = state.conversationList.find(
-    (item) => item.thread_id === payload.thread_id,
-  )
-  if (hit && hit.session_id === state.activeSessionId) {
+  // 命中判定以 session_id 为准：会话级列表项不再持有 thread_id，
+  // 而"这条会话里发生了什么"才是中栏需要响应的语义。
+  if (payload.session_id && payload.session_id === state.activeSessionId) {
     await refreshMessages()
   }
 }
@@ -430,25 +480,8 @@ function applyResult(result: ApplyResult) {
   }
   state.activeMessages.push(message)
 
-  // 左栏：服务端返回的线程摘要为唯一真相源（标题 / 状态 / 锁版本一律以它为准）
-  const serverThread = result.thread ?? {}
-  const summary: TaskSummary = {
-    thread_id: result.thread_id,
-    session_id: result.session_id ?? state.activeSessionId,
-    creator_id: String(serverThread.creator_id ?? ''),
-    assigned_role: String(serverThread.assigned_role ?? ''),
-    status: String(serverThread.status ?? result.status ?? 'WAITING_HUMAN'),
-    lock_version: Number(
-      serverThread.lock_version ?? card.lock_version ?? 1,
-    ),
-    current_node: serverThread.current_node ?? null,
-    title:
-      typeof serverThread.title === 'string' && serverThread.title
-        ? serverThread.title
-        : undefined,
-  }
-  upsertConversation(summary)
-
+  // 左栏不在本地拼装列表项：左栏是**会话级**聚合视图，前端既拿不准
+  // 关联计数，也捏不出准确代表态 —— 一律走服务端对齐（markConversationsStale）。
   // 中栏新增内容尚未经服务端确认 → 本轮不写本地快照
   suppressMessageWrite = true
   // 左栏随后与服务端对齐一次（标题 / 状态以服务端为准）
@@ -462,15 +495,38 @@ function setRightDrawer(open: boolean) {
 }
 
 /**
- * 重置内存态（登出时调用）。
+ * 打开只读检视（点中栏某张卡片）。
+ *
+ * 检视态是**唯一**的高亮来源：中栏卡片的选中边框由它派生，
+ * 不另存第二份"高亮状态"，杜绝面板与高亮失配。
+ */
+function openInspection(threadId: string, cardType: string | null): void {
+  state.inspectedThreadId = threadId
+  state.inspectedCardType = cardType ?? ''
+}
+
+/** 关闭只读检视（同步取消中栏卡片高亮）。 */
+function closeInspection(): void {
+  state.inspectedThreadId = ''
+  state.inspectedCardType = ''
+}
+
+/**
+ * 重置内存态（登出 / 切换身份时调用）。
  *
  * 同时解除落盘归属（conversationOwnerId 置空）：此后任何响应式变更都不会
- * 再触发本地写盘，否则登出清理完成后，排队中的落盘会把分区重新写回来。
+ * 再触发本地写盘，否则清理完成后，排队中的落盘会把分区重新写回来。
+ *
+ * 切换身份时复用本函数（而非另写一套重置）：两套逻辑必然漂移，共用是唯一
+ * 正确选择。切换分支必须在清本机分区**之前**调用，否则旧消息会被写进新身份
+ * 的本地分区。
  */
 function resetAll(): void {
   conversationOwnerId = null
   messagesSessionId = ''
   suppressMessageWrite = false
+  // 作废在途的会话打开请求
+  openSessionSeq += 1
   setConversations([])
   state.activeMessages.splice(0, state.activeMessages.length)
   state.activeSessionId = ''
@@ -482,6 +538,10 @@ function resetAll(): void {
   state.conversationTotal = 0
   state.conversationQuery = ''
   state.conversationFetched = 0
+  state.activeOwnerId = ''
+  // 检视态必须随身份一起清空：否则检视面板会残留上一身份的数据
+  state.inspectedThreadId = ''
+  state.inspectedCardType = ''
 }
 
 // 会话集合变更 → 按归属用户防抖落盘（服务端副本的本地缓存）
@@ -502,6 +562,9 @@ watch(
   (list) => {
     if (suppressMessageWrite) return
     if (conversationOwnerId && messagesSessionId) {
+      // 会话号必须与当前会话一致：身份切换后残留的旧会话号若与新归属搭配，
+      // 会把旧身份的消息写进新身份的本地分区（共享终端越权残留）
+      if (messagesSessionId !== state.activeSessionId) return
       debounceSaveMessages(
         conversationOwnerId,
         messagesSessionId,
@@ -529,6 +592,8 @@ export function useWorkbenchStore() {
     applyResult,
     setConversations,
     setRightDrawer,
+    openInspection,
+    closeInspection,
     resetAll,
   }
 }

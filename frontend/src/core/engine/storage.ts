@@ -10,13 +10,18 @@
  * - 容量上限 + TTL，避免无界增长；
  * - 写入前剔除敏感字段（签名/令牌/口令等），本地不留存凭据材料；
  * - 配额溢出时淘汰最旧快照重试，失败则显式置为不可写（不再假装健康）。
+ *
+ * v3 相对 v2 的变化：
+ * - 会话集合快照改为**会话级**聚合结构（左栏一行 = 一个会话）；
+ * - 迁移期直接丢弃 v2 的会话集合快照（线程级数组推不出关联计数与代表态，
+ *   错的计数比没有更糟）；服务端为权威源，本地快照随时可由服务端重建。
  */
 
 import localforage from 'localforage'
 import { isReactive, reactive, toRaw } from 'vue'
 
 /** 当前快照 schema 版本 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 /** 快照来源：服务端权威副本 / 本地缓存 */
 export type SnapshotSource = 'server' | 'cache'
@@ -127,26 +132,18 @@ function conversationsKey(userId: string): string {
   return `conversations:${userId}`
 }
 
-/** v1 信封形状（{updatedAt, messages}）判定。 */
-function isLegacyEnvelope(
-  value: unknown,
-): value is { updatedAt: number; messages: unknown } {
-  if (!value || typeof value !== 'object') return false
-  const legacy = value as { v?: unknown; updatedAt?: unknown; messages?: unknown }
-  if (typeof legacy.v === 'number') return false
-  return typeof legacy.updatedAt === 'number' && 'messages' in legacy
-}
-
 /**
- * v1 → v2 迁移（模块级记忆化，公开 API 前置等待）。
+ * v2 → v3 迁移（模块级记忆化，公开 API 前置等待）。
  *
  * - v1 会话键 `session:<sessionId>` 无用户分区，无法安全归属 → 直接丢弃
  *   （服务端已成权威源，旧会话快照无回退价值）；
- * - v1 会话集合 `conversations:<userId>` 的信封补齐为 v2 结构。
+ * - 会话集合键 `conversations:<userId>`：v2 存的是**线程级**数组，v3 的
+ *   左栏是**会话级**聚合视图。线程级数组推不出正确的关联计数与代表态，
+ *   错的计数比没有更糟 → 整体丢弃，由服务端权威源重建。
  */
-const migrationPromise: Promise<void> = migrateToV2()
+const migrationPromise: Promise<void> = migrateToV3()
 
-async function migrateToV2(): Promise<void> {
+async function migrateToV3(): Promise<void> {
   try {
     const allKeys = await messageStore.keys()
     for (const key of allKeys) {
@@ -161,15 +158,8 @@ async function migrateToV2(): Promise<void> {
         continue
       }
       if (key.startsWith('conversations:')) {
-        const legacy = await messageStore.getItem<unknown>(key)
-        if (isLegacyEnvelope(legacy)) {
-          await messageStore.setItem(key, {
-            v: SCHEMA_VERSION,
-            updatedAt: legacy.updatedAt,
-            source: 'cache',
-            data: legacy.messages,
-          })
-        }
+        // v2 会话集合为线程级数组，无法换算为会话级聚合 → 整体丢弃
+        await messageStore.removeItem(key)
       }
     }
   } catch (error) {

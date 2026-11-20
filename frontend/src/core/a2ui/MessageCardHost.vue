@@ -19,12 +19,30 @@ const props = defineProps<{
  * 卡片动作事件透传。
  *
  * 卡片组件内部自行提交后端（依赖反转），宿主的职责只是把结果上报给
- * 上层：decided = 审批完成（需刷新左栏），conflict = CAS 冲突（项已失效）。
+ * 上层：decided = 审批完成（需刷新左栏），conflict = CAS 冲突（项已失效），
+ * inspect = 用户点击卡片，请求打开只读详情检视。
  */
 const emit = defineEmits<{
   decided: [permitted: boolean]
   conflict: []
+  inspect: [message: ChatMessageRecord]
 }>()
+
+/**
+ * 卡片点击 → 上抛只读检视请求。
+ *
+ * 交互控件（按钮 / 链接 / 输入控件）上的点击一律忽略：
+ * 用户点"核准/驳回"时不该顺手打开只读面板，否则审批动作会被误读成"查看详情"。
+ *
+ * core 不判断卡片类型是否可检视 —— 是否存在对应检视视图由插件注册表决定。
+ */
+function handleCardClick(event: MouseEvent): void {
+  const target = event.target as HTMLElement | null
+  if (target?.closest('button, a, input, textarea, select')) {
+    return
+  }
+  emit('inspect', props.message)
+}
 
 // 动态组件（未注册时为 undefined → 走兜底）
 const resolved = computed(() =>
@@ -38,7 +56,7 @@ const fallbackJson = computed(() =>
 </script>
 
 <template>
-  <div class="w-full">
+  <div class="w-full" @click="handleCardClick">
     <component
       :is="resolved"
       v-if="resolved"

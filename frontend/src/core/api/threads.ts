@@ -9,7 +9,13 @@
  */
 
 import { http } from './http'
-import type { ChatMessageRecord, TaskSummary } from '../a2ui/types'
+import type {
+  CardSnapshot,
+  ChatMessageRecord,
+  SessionSummary,
+  TaskSummary,
+  ThreadDetail,
+} from '../a2ui/types'
 
 /** 线程列表端点（相对 /api） */
 export const THREADS_PATH = '/v1/threads'
@@ -55,6 +61,44 @@ export interface MessageListResponse {
   has_more: boolean
   server_time?: string
   total?: number
+}
+
+/** 会话聚合列表响应（左栏「我的会话」） */
+export interface SessionListResponse {
+  items: SessionSummary[]
+  has_more: boolean
+  /** 过滤后的可见会话总数 */
+  total?: number
+  server_time: string
+}
+
+/** 线程只读详情响应 */
+export interface ThreadDetailResponse {
+  /** 线程元信息 */
+  thread: ThreadDetail
+  /** 线程内最新一张卡片（不限类型） */
+  card: CardSnapshot | null
+  /** 线程内每种卡片类型的最新一张 */
+  cards: CardSnapshot[]
+  server_time: string
+}
+
+/** 拉取按 session_id 聚合的可见会话列表。 */
+export async function fetchSessions(
+  params: { q?: string; limit?: number; offset?: number } = {},
+): Promise<SessionListResponse> {
+  const { data } = await http.get<SessionListResponse>(SESSIONS_PATH, { params })
+  return data
+}
+
+/** 拉取线程只读详情（线程元信息 + 卡片快照）。 */
+export async function fetchThreadDetail(
+  threadId: string,
+): Promise<ThreadDetailResponse> {
+  const { data } = await http.get<ThreadDetailResponse>(
+    `${THREADS_PATH}/${encodeURIComponent(threadId)}`,
+  )
+  return data
 }
 
 /** 拉取当前用户可见的线程列表。 */

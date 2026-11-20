@@ -15,21 +15,47 @@ defineProps<{
   currentUserId: string
   /** 外部响应式消息列表（store 持有） */
   messages: ChatMessageRecord[]
+  /** 正在被只读检视的线程标识（用于卡片高亮；空串表示无） */
+  inspectedThreadId?: string
+  /** 正在被只读检视的卡片类型（用于卡片高亮；空串表示无） */
+  inspectedCardType?: string
 }>()
 
 /** 卡片动作事件上抛（宿主据此刷新左栏 / 剔除失效项） */
 const emit = defineEmits<{
   decided: [permitted: boolean]
   conflict: []
+  /** 用户点击卡片 → 请求打开只读详情检视 */
+  inspect: [message: ChatMessageRecord]
 }>()
 
-// 卡片动作上下文（dispatch 占位，业务动作后续注入）
+// 卡片动作上下文（dispatch 已接上检视通道；其余业务动作后续注入）
 function makeActionContext(message: ChatMessageRecord): CardActionContext {
   return {
     threadId: message.thread_id,
     retryPayload: message.retry_payload,
-    dispatch: () => undefined,
+    dispatch: (action: string) => {
+      if (action === 'inspect') {
+        emit('inspect', message)
+      }
+    },
   }
+}
+
+/**
+ * 判断某张卡片是否正处于检视态（决定是否加高亮边框）。
+ *
+ * 匹配键为「线程 + 卡片类型」：同一线程内可能并存多种卡片，
+ * 只按线程匹配会把多张卡片一起点亮。
+ */
+function isInspected(
+  message: ChatMessageRecord,
+  inspectedThreadId: string | undefined,
+  inspectedCardType: string | undefined,
+): boolean {
+  if (!inspectedThreadId) return false
+  if (message.thread_id !== inspectedThreadId) return false
+  return (message.card_type ?? '') === (inspectedCardType ?? '')
 }
 
 function textHtml(message: ChatMessageRecord): string {
@@ -52,13 +78,17 @@ function textHtml(message: ChatMessageRecord): string {
       <!-- 卡片类型 -->
       <div
         v-if="message.kind === 'card'"
-        class="w-full max-w-md rounded-lg border border-gray-200 bg-white p-3 shadow-sm"
+        class="w-full max-w-md rounded-lg border bg-white p-3 shadow-sm transition"
+        :class="isInspected(message, inspectedThreadId, inspectedCardType)
+          ? 'border-blue-500 ring-2 ring-blue-500'
+          : 'border-gray-200'"
       >
         <MessageCardHost
           :message="message"
           :action-context="makeActionContext(message)"
           @decided="(permitted: boolean) => emit('decided', permitted)"
           @conflict="emit('conflict')"
+          @inspect="(target: ChatMessageRecord) => emit('inspect', target)"
         />
       </div>
 

@@ -72,6 +72,69 @@ export interface TaskSummary {
 }
 
 /**
+ * 会话摘要：左栏按 session_id 聚合后的一行。
+ *
+ * 一个会话内可产生多条线程（对话线程 + 若干业务线程），本结构是这些线程的
+ * 聚合视图：会话可见 = 组内至少一条线程对当前用户可见。
+ */
+export interface SessionSummary {
+  /** 会话标识 */
+  session_id: string
+  /** 会话展示标题（组内最早对话线程标题；无对话线程时回落最早线程） */
+  title: string
+  /** 代表态状态（业务语义由发布方定义，core 不解释） */
+  status: string
+  /** 组内关联线程数（不含对话线程） */
+  related_count: number
+  /** 组内线程总数 */
+  thread_count: number
+  /** 创建时间（服务端 ISO 串） */
+  created_at?: string | null
+  /** 更新时间（服务端 ISO 串） */
+  updated_at?: string | null
+  /** 最近活跃时间（服务端 ISO 串） */
+  last_activity_at?: string | null
+}
+
+/** 线程详情（只读端点返回的线程元信息） */
+export interface ThreadDetail {
+  thread_id: string
+  session_id: string
+  creator_id: string
+  creator_role: string
+  assigned_role: string
+  operator_id: string | null
+  status: string
+  lock_version: number
+  current_node: string | null
+  /** 外部单号弱引用（core 只当不透明字符串） */
+  biz_order_id: string | null
+  title: string | null
+  is_archived: boolean
+  created_at: string | null
+  updated_at: string | null
+  last_activity_at: string | null
+}
+
+/** 卡片快照（只读端点返回的卡片载荷） */
+export interface CardSnapshot {
+  id: number
+  seq: number | null
+  card_type: string | null
+  card_payload: Record<string, unknown> | null
+  /** 卡片视图投影版本（原地改写时递增） */
+  card_version: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 只读检视目标：被点开的卡片（线程 + 卡片类型） */
+export interface InspectionTarget {
+  thread_id: string
+  card_type: string | null
+}
+
+/**
  * WorkflowEndpoints —— 工作流端点配置（依赖反转）。
  * 由各业务插件提供具体 URL，core 视图不写死任何业务路径。
  *

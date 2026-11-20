@@ -72,8 +72,11 @@ async function fetchTasks(force = false) {
   }
   configError.value = null
 
+  // 发起时的生效身份：响应回来时身份若已变，这份数据属于旧身份，必须丢弃
+  const ownerId = workbench.state.activeOwnerId
   // 角色由后端按 JWT 判定，前端不传任何角色参数
   const { data } = await http.get<{ items: TaskSummary[] }>(tasksUrl)
+  if (ownerId !== workbench.state.activeOwnerId) return
   tasks.value = data.items ?? []
   loaded = true
   fetchedAtTick = workbench.state.workflowEventTick
@@ -100,13 +103,17 @@ async function loadDetail(threadId: string) {
       '工作流端点未配置：业务插件未注册或后端清单未同步，请检查插件装载状态。'
     return
   }
+  const ownerId = workbench.state.activeOwnerId
   try {
     const { data } = await http.get<{ items: ChatMessageRecord[] }>(
       messagesUrl,
       { params: { thread_id: threadId } },
     )
+    // 身份在请求期间已变 → 丢弃旧身份的详情
+    if (ownerId !== workbench.state.activeOwnerId) return
     detailMessages.value = data.items ?? []
   } catch {
+    if (ownerId !== workbench.state.activeOwnerId) return
     detailMessages.value = []
   }
 }
@@ -187,6 +194,27 @@ watch(
   () => workbench.state.workflowEventTick,
   () => {
     void fetchTasks()
+  },
+)
+
+/**
+ * 生效身份变化 → 旧身份的待办与详情立即失效，并按新身份重拉。
+ *
+ * 判据用"生效身份"（凭据真正对应的用户）而非下拉框选中值：
+ * 选中值先变、凭据后换，用选中值会在新令牌尚未生效时就去取数。
+ */
+watch(
+  () => workbench.state.activeOwnerId,
+  async (ownerId) => {
+    // 先清空：旧身份的待办与详情不得留在界面上
+    tasks.value = []
+    selectedThreadId.value = null
+    selectedTask.value = null
+    detailMessages.value = []
+    loaded = false
+    fetchedAtTick = -1
+    if (!ownerId) return
+    await activate()
   },
 )
 
