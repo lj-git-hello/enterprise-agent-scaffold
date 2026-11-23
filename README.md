@@ -1,6 +1,6 @@
-# power-dispatch-agent
+# enterprise-agent-scaffold
 
-> **一句话定位**：一套「零业务耦合」的通用 AI Agent 脚手架底座 —— Core 层与 Plugin 层物理隔离，接入新业务只需新增一个插件目录，底座零改动；仓库内置 `power_grid` 电网检修调度插件作为完整落地样例。
+> **一句话定位**：**企业级通用 AI Agent 协同工作台与执行中枢脚手架**（FastAPI + LangGraph + Vue 3）—— Core 层与 Plugin 层物理隔离，支持双连接池隔离、CAS 乐观锁、人机协同（HITL）、流式 RAG 与 Core+Plugin 插件化业务扩展；接入新业务只需新增一个插件目录，底座零改动。仓库内置 `power_grid` 电网检修调度插件作为完整落地样例。
 
 ## 特性速览
 
@@ -17,7 +17,7 @@
 
 ### 1.1 Core + Plugin 双层物理隔离
 
-`power-dispatch-agent` 是一个**通用 AI Agent 脚手架**（FastAPI 应用标题即 `企业级 AI Agent 通用脚手架`）。仓库刻意采用「双层物理隔离」结构，把「可复用的 Agent 中台能力」与「具体的垂直业务」彻底分开：
+`enterprise-agent-scaffold` 是一个**企业级通用 AI Agent 协同工作台与执行中枢脚手架**（FastAPI 应用标题即 `企业级 AI Agent 通用脚手架`）。仓库刻意采用「双层物理隔离」结构，把「可复用的 Agent 中台能力」与「具体的垂直业务」彻底分开：
 
 ```
 backend/app/core/           ← 通用底座：零业务词汇
@@ -217,7 +217,7 @@ PostgreSQL 16 + pgvector。服务端 `vector` 扩展版本 **0.8.7**（由 `pgve
 ## 4. 仓库目录结构
 
 ```
-power-dispatch-agent/
+enterprise-agent-scaffold/
 ├── CLAUDE.md                                    # 项目级工程规范（目录拓扑 / 红线 / 门禁）
 ├── PROJECT_ARCHITECTURE_AND_TEST_GUIDE.md       # 系统设计说明书 + 手工测试验证指南（3777 行）
 ├── 企业级通用 AI Agent 通用脚手架 · 落地开发与架构全景指南.md   # v2.0 生产级实施规约（2687 行）

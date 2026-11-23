@@ -1,5 +1,5 @@
 # =============================================================================
-# power-dispatch-agent 开发 / 测试专用锁版依赖
+# enterprise-agent-scaffold 开发 / 测试专用锁版依赖
 #
 # 用途：本地开发、pytest 异步单测；不进入生产镜像。
 # 安装：pip install -r requirements-dev.txt

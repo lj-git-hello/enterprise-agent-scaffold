@@ -1,4 +1,4 @@
-# 项目级工程规范：企业级 AI Agent 通用底座与电网业务插件 (power-dispatch-agent)
+# 项目级工程规范：企业级 AI Agent 通用底座与电网业务插件 (enterprise-agent-scaffold)
 
 > 本文件仅记录本仓库特有的目录拓扑、接口契约、业务红线与本地运行门禁；通用编码、并发安全与提速纪律遵循用户级 `~/.claude/CLAUDE.md`。
 

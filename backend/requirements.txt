@@ -1,5 +1,5 @@
 # =============================================================================
-# power-dispatch-agent 后端锁版依赖清单
+# enterprise-agent-scaffold 后端锁版依赖清单
 #
 # 生成方式：conda 环境 (power-agent) 全量 pip freeze 导出
 # 生成日期：2026-11-06
