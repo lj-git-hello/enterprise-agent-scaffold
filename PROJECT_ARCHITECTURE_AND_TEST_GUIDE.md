@@ -1205,7 +1205,7 @@ let conversationOwnerId: string | null = null
 
 ```typescript
 const message: ChatMessageRecord = {
-  id: crypto.randomUUID(),
+  id: generateUUID(),
   thread_id: result.thread_id,
   role: 'assistant',
   kind: text ? 'text' : 'card',        // ← 后端返 message（安规否决）时退化为纯文本

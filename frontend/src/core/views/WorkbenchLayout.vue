@@ -35,6 +35,7 @@ import {
 } from '../engine/storage'
 import { PluginRegistry, type PluginIdentity } from '../plugins/registry'
 import { formatDateTime } from '../utils/datetime'
+import { generateUUID } from '../utils/uuid'
 import {
   type ApplyResult,
   useWorkbenchStore,
@@ -289,7 +290,7 @@ const sseStatusHint =
 
 // ---- 当前会话（ID 与消息由共享 store 持有） ----
 function newSessionId(): string {
-  return crypto.randomUUID()
+  return generateUUID()
 }
 // 初始化一个本地会话（延迟落库，不发请求）
 workbench.setSession(newSessionId())
@@ -482,11 +483,11 @@ async function sendDraft() {
   const threadId = sessionId.value
   const createdAt = new Date().toISOString()
   // 客户端幂等键：同一轮唯一，服务端据此识别整轮重放
-  const clientMsgId = crypto.randomUUID()
+  const clientMsgId = generateUUID()
 
   // 用户消息立即入列
   workbench.appendMessage({
-    id: crypto.randomUUID(),
+    id: generateUUID(),
     thread_id: threadId,
     role: 'user',
     kind: 'text',
@@ -498,7 +499,7 @@ async function sendDraft() {
   })
 
   // 助手占位消息：打字机逐字写入
-  const answerId = crypto.randomUUID()
+  const answerId = generateUUID()
   workbench.appendMessage({
     id: answerId,
     thread_id: threadId,
@@ -534,7 +535,7 @@ async function sendDraft() {
         onToken: (content) => ticker?.enqueue(content),
         onCard: (cardType, data) => {
           workbench.appendMessage({
-            id: crypto.randomUUID(),
+            id: generateUUID(),
             thread_id: threadId,
             role: 'assistant',
             kind: 'card',

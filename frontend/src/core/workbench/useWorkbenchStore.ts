@@ -27,6 +27,7 @@ import {
   loadMessages,
 } from '../engine/storage'
 import { PluginRegistry } from '../plugins/registry'
+import { generateUUID } from '../utils/uuid'
 
 /** 数据来源标记 */
 export type DataSource = 'server' | 'cache' | 'live' | 'none'
@@ -504,7 +505,7 @@ function applyResult(result: ApplyResult) {
   // 中栏：卡片快照消息（MessageCardHost 据 card_type 动态渲染）；
   // 后端返回文本结果时（如流程自动终止）退化为纯文本消息，避免空卡片。
   const message: ChatMessageRecord = {
-    id: crypto.randomUUID(),
+    id: generateUUID(),
     thread_id: result.thread_id,
     role: 'assistant',
     kind: text ? 'text' : 'card',
