@@ -301,6 +301,8 @@ const draftText = ref('')
 function createNewSession() {
   // 仅重置当前会话与中栏消息；严禁删除/覆盖会话集合中已有记录
   workbench.setSession(newSessionId())
+  // 新会话不属于上一轮：作废其"思考中"等待提示
+  workbench.clearPendingReply()
   draftText.value = ''
   activeTab.value = 'history'
 }
@@ -516,8 +518,9 @@ async function sendDraft() {
 
   isStreaming.value = true
   abortController = new AbortController()
-  // 实时内容尚未经服务端确认 → 暂不落本地快照
-  workbench.beginLiveTurn()
+  // 实时内容尚未经服务端确认 → 暂不落本地快照；
+  // 同时登记本轮的等待对象：首个 token 落地前，中栏需要明确的"思考中"反馈。
+  workbench.beginLiveTurn(answerId)
 
   try {
     await chatStream(
@@ -544,15 +547,19 @@ async function sendDraft() {
         },
         onError: (message) => {
           streamError.value = message
+          // 出错即结束等待态：不能让"思考中"与错误提示同时挂在界面上
+          workbench.clearPendingReply()
         },
         onDone: () => {
           // 立即排空打字机缓冲区，避免尾字滞留导致落盘内容不全
           ticker?.flush()
           ticker = null
           isStreaming.value = false
+          workbench.clearPendingReply()
         },
         onReplay: () => {
           streamError.value = '本轮此前已提交，服务端未重复执行；已按服务端记录刷新。'
+          workbench.clearPendingReply()
         },
         onStatus: (status) => {
           sseStatus.value = status
@@ -573,6 +580,8 @@ async function sendDraft() {
     abortController = null
     // 本轮结束：中断标记复位（异常路径已在 catch 中先行消费）
     identitySwitchAbort = false
+    // 收尾兜底：无论正常结束还是异常中断，都不再显示"思考中"等待提示
+    workbench.clearPendingReply()
     // 与服务端对齐权威副本（并恢复本地快照写入）
     void workbench.refreshMessages()
     // 本轮新建了聊天线程 → 左栏与服务端对齐一次（标题 / 状态以服务端为准）
@@ -780,7 +789,8 @@ onMounted(async () => {
         <div class="flex-1 overflow-hidden">
           <TaskHistoryList v-if="activeTab === 'history'" :session-id="sessionId" :current-user-id="currentIdentity.id"
             :messages="workbenchState.activeMessages" :inspected-thread-id="workbenchState.inspectedThreadId"
-            :inspected-card-type="workbenchState.inspectedCardType" @inspect="handleInspect" />
+            :inspected-card-type="workbenchState.inspectedCardType"
+            :pending-reply-id="workbenchState.pendingReplyId" @inspect="handleInspect" />
           <TaskApprovalPool v-else :current-user-id="currentIdentity.id" :current-role="currentIdentity.role" />
         </div>
 

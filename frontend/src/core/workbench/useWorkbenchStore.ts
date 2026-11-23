@@ -102,6 +102,15 @@ interface WorkbenchState {
   inspectedThreadId: string
   /** 正在被检视的卡片类型（无则为空串） */
   inspectedCardType: string
+  /**
+   * 等待首个 token 的助手消息 ID（无则为空串）。
+   *
+   * 从本轮请求发出、到首个 token 落地之间，界面必须给出明确反馈：
+   * 否则用户面对的是一段没有任何提示的静默等待，无法区分"还在思考"与"已经卡住"。
+   * 该值同时承担"流在进行中"与"等待对象是谁"两项语义：
+   * 收到正文 / 流结束 / 出错 / 切换会话，任一情形都会清空它。
+   */
+  pendingReplyId: string
 }
 
 const state = reactive<WorkbenchState>({
@@ -122,6 +131,7 @@ const state = reactive<WorkbenchState>({
   activeOwnerId: '',
   inspectedThreadId: '',
   inspectedCardType: '',
+  pendingReplyId: '',
 })
 
 /** 会话集合归属用户（切换身份时随之切换并重新拉取）。 */
@@ -205,6 +215,10 @@ function setSession(sessionId: string, messages: ChatMessageRecord[] = []) {
   messagesSessionId = sessionId
   state.activeSessionId = sessionId
   state.activeMessages.splice(0, state.activeMessages.length, ...messages)
+  // 注意：此处**不**清空 pendingReplyId ——
+  // setSession 同时被服务端回读（refreshMessages）复用，而回读与下一轮发送
+  // 可能重叠；在回读里清等待态会误杀正在进行中的那轮反馈。
+  // 真正的会话切换路径（openConversation / 新建会话 / resetAll）各自清理。
 }
 
 /** 直接追加一条消息（实时流 / 文本回执均可）。 */
@@ -222,6 +236,11 @@ function appendMessageText(id: string, chunk: string) {
   const target = state.activeMessages.find((item) => item.id === id)
   if (!target) return
   target.content = (target.content ?? '') + chunk
+  // 首个 token 落地即结束等待态：中栏的"思考中"提示在此与正文无缝衔接。
+  // 判据用"写入后是否有正文"而非"本次分片是否非空" —— 打字机可能先吐空分片。
+  if (state.pendingReplyId === id && (target.content ?? '').length > 0) {
+    state.pendingReplyId = ''
+  }
 }
 
 /** 整体替换左栏列表（服务端回读 / 缓存兜底）。 */
@@ -349,6 +368,8 @@ async function openConversation(summary: SessionSummary): Promise<void> {
   if (!ownerId) return
   // 切换会话即关闭检视：被检视的卡片属于上一个会话，留着只会看到错位的详情
   closeInspection()
+  // 切换会话即作废上一轮的等待态：等待提示只对当前会话的助手消息有意义
+  state.pendingReplyId = ''
   try {
     const resp = await fetchSessionMessages(summary.session_id, { limit: 300 })
     // 归属已变（切换身份）或已被更新的打开请求抢占 → 丢弃响应
@@ -419,9 +440,24 @@ function persistMessagesSnapshot(): void {
   )
 }
 
-/** 标记实时流开始：实时内容暂不落本地快照。 */
-function beginLiveTurn(): void {
+/**
+ * 标记实时流开始：实时内容暂不落本地快照。
+ *
+ * @param replyId 本轮等待首个 token 的助手消息 ID（空串表示不标记等待态）
+ */
+function beginLiveTurn(replyId: string = ''): void {
   suppressMessageWrite = true
+  state.pendingReplyId = replyId
+}
+
+/**
+ * 清除首字等待态。
+ *
+ * 触发时机：收到正文（由 appendMessageText 自动完成）、流正常结束、
+ * 流报错、整轮被放弃（重放 / 中止）。任一情形下都不应继续显示"思考中"。
+ */
+function clearPendingReply(): void {
+  state.pendingReplyId = ''
 }
 
 /** 标记会话集合陈旧（递增计数，视图据此触发一次服务端对齐）。 */
@@ -542,6 +578,8 @@ function resetAll(): void {
   // 检视态必须随身份一起清空：否则检视面板会残留上一身份的数据
   state.inspectedThreadId = ''
   state.inspectedCardType = ''
+  // 等待态同理：换人后上一轮的在途等待不得继续显示
+  state.pendingReplyId = ''
 }
 
 // 会话集合变更 → 按归属用户防抖落盘（服务端副本的本地缓存）
@@ -587,6 +625,7 @@ export function useWorkbenchStore() {
     searchConversations,
     refreshMessages,
     beginLiveTurn,
+    clearPendingReply,
     markConversationsStale,
     handleWorkflowEvent,
     applyResult,
